@@ -1,6 +1,4 @@
 import { create } from 'zustand'
-import { loadPlus } from '../lib/gameProfile'
-import { hasMillidaAccount } from '../lib/api'
 import type { ShopTier } from '../lib/rubies'
 
 interface PlusState {

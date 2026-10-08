@@ -1,11 +1,8 @@
 import { hasTauri } from '../ipc/tauri'
 import { setAppIcon } from '../ipc/commands'
 import { readPref, writePref } from './prefs'
-import { hasMillidaAccount } from './api'
-import { loadInvites } from './referrals'
-import { usePlus } from '../state/plus'
-import { effectiveIcon, isIconId } from './appIconRules'
-import type { AppIconId, IconAccess } from './appIconRules'
+import { isIconId } from './appIconRules'
+import type { AppIconId } from './appIconRules'
 
 export { APP_ICONS, effectiveIcon, iconUnlocked, isIconId } from './appIconRules'
 export type { AppIconDef, AppIconId, IconAccess } from './appIconRules'

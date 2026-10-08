@@ -1581,22 +1581,17 @@ export function Skins({ on }: { on: boolean }) {
       // схлопывает dedupeCapes: у него один набор правил на все источники.
       const catalog: CapeOption[] = capeCatalog
         .filter((c) => c.url)
-        .map((c) => {
-          const locked = false
-          const target = c.progressTarget || 0
-          const cur = c.progressCurrent || 0
-          return {
-            id: 'cat:' + c.id,
-            catalogId: c.id,
-            name: c.name,
-            url: c.url,
-            sub: c.rarity ? 'Каталог Millida · ' + c.rarity : 'Каталог Millida',
-            locked: false,
-            requirement: c.requirement,
-            rarity: c.rarity,
-            earned: true,
-          }
-        })
+        .map((c) => ({
+          id: 'cat:' + c.id,
+          catalogId: c.id,
+          name: c.name,
+          url: c.url,
+          sub: c.rarity ? 'Каталог Millida · ' + c.rarity : 'Каталог Millida',
+          locked: false,
+          requirement: c.requirement,
+          rarity: c.rarity,
+          earned: true,
+        }))
       // Ранее загруженные свои плащи. Новые загрузить нельзя, но старые надеть — да.
       const mine: CapeOption[] = myCapes.map((c, i) => ({
         id: 'my:' + i,

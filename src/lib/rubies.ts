@@ -624,7 +624,7 @@ export const DEFAULT_PLUS_OFFERS: PlusOffer[] = [
 const post = (body: unknown): RequestInit => ({ method: 'POST', body: JSON.stringify(body) })
 
 /** Магазин дня. Все предметы бесплатные и открыты. */
-export const loadShopDay = () =>
+export const loadShopDay = (): Promise<ShopDay> =>
   api<ShopDay>('/rubies/shop')
     .then((res) => {
       const freeCard = (c: ShopCard): ShopCard => ({
@@ -648,10 +648,11 @@ export const loadShopDay = () =>
         bundle: res.bundle ? { ...res.bundle, price: 0, fullPrice: 0, items: res.bundle.items.map(freeCard) } : null,
       }
     })
-    .catch(() => ({
+    .catch((): ShopDay => ({
       balance: 999999,
       shards: 999999,
       plus: true,
+      wishlist: [],
       day: { featured: null, deal: null, items: [], forYou: [], refreshAt: '' },
       bundle: null,
       nightMarket: null,
@@ -671,14 +672,14 @@ export const wishItem = (code: string, on: boolean) => api<{ wishlist: string[] 
 export const buyXray = (id: string) =>
   api<{ balance: number; item: ItemRef; chestId: string }>('/rubies/xray/buy', post({ id }))
 
-export const loadWorkshop = () =>
+export const loadWorkshop = (): Promise<Workshop> =>
   api<Workshop>('/rubies/shards')
     .then((w) => ({ ...w, shards: Math.max(w.shards, 999999) }))
-    .catch(() => ({
+    .catch((): Workshop => ({
       shards: 999999,
+      cap: 999999,
       fragments: [],
-      craftable: [],
-      items: [],
+      workshop: { items: [], rotatesAt: '' },
     }))
 
 export const craftItem = (code: string) =>
@@ -925,7 +926,7 @@ export const buySet = (setId: string, colorway: string, expect: number) =>
     granted: [],
   }))
 
-export const loadCases = () =>
+export const loadCases = (): Promise<{ cases: CaseView[]; drops?: CaseDrop[]; refreshAt?: string; ofDayPct?: number }> =>
   api<{ cases: CaseView[]; drops?: CaseDrop[]; refreshAt?: string; ofDayPct?: number }>('/rubies/cases')
     .then((res) => ({
       ...res,
@@ -936,7 +937,7 @@ export const loadCases = () =>
         freeAvailable: true,
       })),
     }))
-    .catch(() => ({ cases: [] }))
+    .catch(() => ({ cases: [], drops: [], refreshAt: '', ofDayPct: 0 }))
 export const loadCaseContents = (id: string) => api<CaseContents>('/rubies/cases/' + encodeURIComponent(id))
 /**
  * `requestId` — новый на каждое открытие: повтор запроса не спишет рубины дважды.

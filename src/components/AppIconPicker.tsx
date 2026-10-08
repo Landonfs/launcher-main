@@ -1,33 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Icon } from './Icon'
-import { setScreen } from '../state/ui'
-import { usePremiumTheme } from '../lib/premiumTheme'
-import { pickFriendsTab } from './friends/friendsView'
-import { usePlus } from '../state/plus'
-import { hasMillidaAccount } from '../lib/api'
-import { loadInvites } from '../lib/referrals'
-import { APP_ICONS, chosenIcon, iconUnlocked, pickAppIcon } from '../lib/appIcon'
+import { APP_ICONS, chosenIcon, pickAppIcon } from '../lib/appIcon'
 import type { AppIconId } from '../lib/appIcon'
 import '../styles/pixel/invite.css'
 
-/// Выбор иконки окна, панели задач и Dock. Закрытые иконки показаны целиком и
-/// крупно — с замком в углу и условием под именем («Пригласи 10 друзей»,
-/// «Только с PLUS»). PLUS и Diamond читаются с аккаунта, остальное — с лестницы друзей.
+/// Выбор иконки окна, панели задач и Dock. Все иконки открыты.
 export function AppIconPicker() {
-  const plus = usePlus((s) => s.active)
-  const diamond = usePlus((s) => s.diamond)
-  const [perks, setPerks] = useState<string[]>([])
   const [picked, setPicked] = useState<AppIconId>(() => chosenIcon())
 
-  useEffect(() => {
-    if (!hasMillidaAccount()) return
-    void usePlus.getState().load()
-    loadInvites()
-      .then((o) => setPerks((o.perks || []).map((p) => p.id)))
-      .catch(() => {})
-  }, [])
-
-  const access = { plus, diamond, perks }
   const pick = (id: AppIconId) => {
     setPicked(id)
     void pickAppIcon(id)
