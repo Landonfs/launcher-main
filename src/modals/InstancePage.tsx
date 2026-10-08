@@ -1,0 +1,2439 @@
+import { ModDownloader } from '../components/build/ModDownloader'
+import { DEMO_MODS } from '../lib/demoMods'
+import { DEMO_USER } from '../lib/demo'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Icon } from '../components/Icon'
+import { BuildIcon } from '../components/playhub/BuildIcon'
+import { BuildIconPicker, BuildMenuItems, useMenuDismiss } from '../components/playhub/MyBuilds'
+import { WorldManager } from '../components/WorldManager'
+import { ScreenshotGallery } from '../components/ScreenshotGallery'
+import { SafetyModal } from '../components/SafetyModal'
+import { SharePackModal } from '../components/SharePackModal'
+import { PackUpdateRow } from '../components/PackUpdateRow'
+import { PackAutoUpdateRow } from '../components/PackAutoUpdateRow'
+import { TunePanel } from '../components/TunePanel'
+import { IconGrid } from '../components/IconGrid'
+import { IconEditor } from '../components/IconEditor'
+import { recallIconRecipe, rememberIconRecipe } from '../lib/iconArt'
+import { uiConfirm } from '../state/confirm'
+import { copyText } from '../lib/clipboard'
+import { hasTauri } from '../ipc/tauri'
+import { listenDragDrop, listenDragState, listenGameLog, listenGameLogStart } from '../ipc/events'
+import {
+  addLocalFile,
+  addServer,
+  auditDeps,
+  checkUpdates,
+  clearProfileCover,
+  countScreenshots,
+  deleteContent,
+  deleteProfile,
+  detectJava,
+  deviceSpecs,
+  duplicateProfile,
+  exportMrpack,
+  getPlayStats,
+  getProfileGroups,
+  listContent,
+  listLogs,
+  listServers,
+  loadProfileSettings,
+  migratePlan,
+  fpsBoostState,
+  gpuSwitchSupported,
+  setProfileGpu,
+  setSkinMod,
+  skinModState,
+  modpackInfo,
+  openProfileFolder,
+  openUrl,
+  pickContentFiles,
+  pickJavaPath,
+  pickProfileCover,
+  pingServer,
+  readLog,
+  removeServer,
+  renameProfile,
+  saveProfileSettings,
+  scanContent,
+  setFpsBoost,
+  scanContentLocal,
+  setProfileGroup,
+  setProfileIcon,
+  setProfileJavaMajor,
+  setProfileLoader,
+  javaMajors,
+  shareLog,
+  testJava,
+  toggleContent,
+  updateAll,
+  updateContent,
+} from '../ipc/commands'
+import type {
+  AuditIssue,
+  DepAudit,
+  FpsBoostState,
+  GpuPref,
+  JavaInfo,
+  ModFile,
+  PingResult,
+  ServerEntry,
+  SkinModState,
+} from '../ipc/commands'
+import { Select } from '../components/Select'
+import { ModVersionPick } from '../components/ModVersionPick'
+import { ContextMenu, type ContextItem } from '../components/ContextMenu'
+import { Slider } from '../components/Slider'
+import { isBlockIcon } from '../lib/blockColor'
+import { RAM_MAX_GB, maxRamGb } from '../lib/ram'
+import { BUILD_NAME_MAX, GROUP_NAME_MAX, LOADER_NAME, fmtPlaytime, fmtSize, loaderId, whenText } from '../lib/format'
+import { AUTO_LOADER_VERSION, hasLoaderVersions, useLoaderBuilds } from '../lib/loaderBuilds'
+import { loaderPinFollowsGame, useCoreUpdate } from '../lib/coreUpdate'
+import { incompatibleWith } from '../lib/compat'
+import { fixItems, issueInstall } from '../lib/deps'
+import { installExtras } from '../lib/install'
+import { ensureMcVersionList, useMcVersionList, versionOptions } from '../state/mcVersionList'
+import { useGuarded, useProfiles } from '../state/profiles'
+import { catalogPackSlug } from '../lib/packUpdate'
+import { useInstance } from '../state/instance'
+import { closeModal, setScreen, showToast, useUi, openModal } from '../state/ui'
+import { runRepair } from '../lib/repair'
+import { joinWithAuth, realLaunch, showLaunchError, startPrelaunch } from '../lib/launch'
+import { useMods } from '../state/mods'
+import { useModpackVersions } from '../state/modpack'
+import { useMigrate } from '../state/migrate'
+import { openProject } from '../state/project'
+import { stopRunningGame, useGame } from '../state/game'
+import { apiErrorText } from '../lib/apiError'
+import { trackFailure } from '../lib/telemetry'
+import { mirrorAsset } from '../lib/api'
+
+/// Имя сборки в тексте ошибки — личное.
+const maskBuild = (e: unknown, name: string | null | undefined) =>
+  name && name.length >= 2 ? String(e).split(name).join('<build>') : String(e)
+
+const ramKey = (p: string) => 'm-ram-' + p
+
+const AUTO_FIX_ROUNDS = 2
+
+const KIND_ICON: Record<string, string> = {
+  mod: 'i-blocks',
+  resourcepack: 'i-image',
+  datapack: 'i-book',
+  shader: 'i-eye',
+}
+
+const KINDS: [string, string][] = [
+  ['mod', 'Моды'],
+  ['resourcepack', 'Ресурспаки'],
+  ['datapack', 'Дата-паки'],
+  ['shader', 'Шейдеры'],
+]
+
+const AUDIT_LABEL: Record<string, string> = {
+  missing: 'не хватает мода',
+  conflict: 'конфликт',
+  version: 'не для этой версии',
+  loader: 'другой загрузчик',
+}
+
+const CONTENT_EXTS: Record<string, string[]> = {
+  mod: ['jar', 'zip', 'litemod'],
+  resourcepack: ['zip'],
+  datapack: ['zip'],
+  shader: ['zip'],
+}
+
+const extsOf = (kind: string) => CONTENT_EXTS[kind] || ['zip']
+const baseName = (p: string) => p.split(/[\\/]/).pop() || p
+const acceptsFile = (kind: string, p: string) => {
+  const parts = baseName(p).split('.')
+  return parts.length > 1 && extsOf(kind).includes(parts[parts.length - 1].toLowerCase())
+}
+
+const CATALOG_PACK_PAGE = 'https://millida.net/modpacks/'
+
+/** A protected build is shared by its catalogue page: its own files are the author's to show. */
+function shareCatalogLink(profile: string) {
+  loadProfileSettings(profile)
+    .then((s) => {
+      const slug = catalogPackSlug(s)
+      if (!slug) throw new Error('у сборки нет страницы в каталоге')
+      return copyText(CATALOG_PACK_PAGE + slug)
+    })
+    .then((copied) => {
+      if (!copied) throw new Error('буфер обмена занят — попробуй ещё раз')
+      showToast('Ссылка на сборку в каталоге скопирована', 'ok')
+    })
+    .catch((e) => showToast('Не удалось скопировать ссылку: ' + apiErrorText(e, 'попробуй ещё раз'), 'error'))
+}
+
+const CORE_OPTS: [string, string][] = [
+  ['vanilla', 'Ванилла'],
+  ['fabric', 'Fabric'],
+  ['quilt', 'Quilt'],
+  ['forge', 'Forge'],
+  ['neoforge', 'NeoForge'],
+]
+
+
+/** Главная кнопка вкладки «Контент»: что именно добавляем (владелец 07.10.2026: «Скачать» непонятно). */
+const ADD_LABEL: Record<string, string> = { mod: 'Добавить моды', resourcepack: 'Добавить ресурс-паки', shader: 'Добавить шейдеры', datapack: 'Добавить дата-паки' }
+export function InstancePage() {
+  const modal = useUi((s) => s.modals.bsModal)
+  const profile = useInstance((s) => s.profile)
+  const profiles = useProfiles((s) => s.profiles)
+  const pr = profiles.find((x) => x.name === profile) || null
+  const guarded = useGuarded(profile)
+  const customCover = pr && pr.icon && !isBlockIcon(pr.icon) ? pr.icon : null
+
+  const [iconEditor, setIconEditor] = useState(false)
+  const [moreOpen, setMoreOpen] = useState(false)
+  const [pickIcon, setPickIcon] = useState(false)
+  useMenuDismiss(moreOpen, () => setMoreOpen(false), '.inst-menu, .inst-more')
+  const [tab, setTab] = useState('content')
+  const [kind, setKind] = useState('mod')
+  const [items, setItems] = useState<ModFile[]>([])
+  const [contentQuery, setContentQuery] = useState('')
+  const [sel, setSel] = useState<Set<string>>(new Set())
+  const [dlOpen, setDlOpen] = useState(false)
+  const [upd, setUpd] = useState<Record<string, string>>({})
+  const [itemLabels, setItemLabels] = useState<Record<string, string>>({})
+  const [emptyList, setEmptyList] = useState(false)
+  const [openInfo, setOpenInfo] = useState('')
+  const [scanLabel, setScanLabel] = useState('Сканировать')
+  const [audit, setAudit] = useState<DepAudit | null>(null)
+  const [auditBusy, setAuditBusy] = useState(false)
+  const [noticeList, setNoticeList] = useState('')
+  const [playtime, setPlaytime] = useState('')
+  const [ram, setRam] = useState(4)
+  const [ramMax, setRamMax] = useState(RAM_MAX_GB)
+
+  useEffect(() => {
+    if (!hasTauri()) return
+    void deviceSpecs()
+      .then((specs) => setRamMax(maxRamGb(specs.ram_mb)))
+      .catch(() => {})
+  }, [])
+
+  // The value may have been stored while the slider reached 16 GB on any
+  // machine, leaving a build that promises itself memory the machine lacks.
+  useEffect(() => {
+    if (!profile || ram <= ramMax) return
+    setRam(ramMax)
+    localStorage.setItem(ramKey(profile), String(ramMax))
+  }, [profile, ram, ramMax])
+  const [boost, setBoost] = useState<FpsBoostState | null>(null)
+  const [boostBusy, setBoostBusy] = useState(false)
+  const [skinMod, setSkinModState] = useState<SkinModState | null>(null)
+  const [skinModBusy, setSkinModBusy] = useState(false)
+  const [jvm, setJvm] = useState('')
+  const [w, setW] = useState('')
+  const [h, setH] = useState('')
+  const [java, setJava] = useState('')
+  const [javaList, setJavaList] = useState<JavaInfo[]>([])
+  const [javaMajor, setJavaMajor] = useState(0)
+  const [gpu, setGpu] = useState<GpuPref>('auto')
+  const [gpuOk, setGpuOk] = useState(true)
+  const [javaAll, setJavaAll] = useState<number[]>([])
+  const [javaBusy, setJavaBusy] = useState(0)
+  const [detectLabel, setDetectLabel] = useState('Найти')
+  const [shotCount, setShotCount] = useState('—')
+  const [mpSlug, setMpSlug] = useState('')
+  const [mpVersion, setMpVersion] = useState('')
+  const [group, setGroup] = useState('')
+  const [servers, setServers] = useState<ServerEntry[]>([])
+  const [pings, setPings] = useState<Record<string, PingResult | null>>({})
+  const [repairBusy, setRepairBusy] = useState(false)
+  const [wFilter, setWFilter] = useState('all')
+  const [wsName, setWsName] = useState('')
+  const [wsIp, setWsIp] = useState('')
+  const [worldsNotice, setWorldsNotice] = useState('')
+  const [logFiles, setLogFiles] = useState<string[]>([])
+  const [logFile, setLogFile] = useState('')
+  const [logBody, setLogBody] = useState('')
+  const [logView, setLogView] = useState<'live' | 'files'>('live')
+  const [liveLines, setLiveLines] = useState<string[]>([])
+  const running = useGame((s) => s.list)
+  const gameStopping = useGame((s) => s.stopping)
+  const thisRunning = !!profile && running.includes(profile)
+  const liveRef = useRef<HTMLPreElement>(null)
+  const [shareLabel, setShareLabel] = useState('Поделиться')
+  const [updateAllLabel, setUpdateAllLabel] = useState('Обновить всё')
+  const [renameVal, setRenameVal] = useState('')
+  const [renameBusy, setRenameBusy] = useState(false)
+  const [newLoader, setNewLoader] = useState('vanilla')
+  const [newLoaderVer, setNewLoaderVer] = useState(AUTO_LOADER_VERSION)
+  const [newVersion, setNewVersion] = useState('')
+  const [coreBusy, setCoreBusy] = useState(false)
+  const lb = useLoaderBuilds(newLoader, newVersion, modal.open)
+  const mcList = useMcVersionList((s) => s.list)
+  const showSnapshots = useMcVersionList((s) => s.show)
+  // The build's own version stays selectable even when it is a snapshot and the
+  // list is filtered down to releases: hiding it would silently change the build.
+  const verOpts = useMemo(
+    () => versionOptions(mcList, showSnapshots, newVersion),
+    [mcList, showSnapshots, newVersion],
+  )
+  const coreUpd = useCoreUpdate(
+    pr ? pr.version : '',
+    pr ? loaderId(pr) : 'vanilla',
+    pr ? pr.loader_version : null,
+    mcList,
+    modal.open && tab === 'opts' && !guarded,
+  )
+  const [note, setNote] = useState('')
+  const logBodyRef = useRef<HTMLPreElement>(null)
+  const kindRef = useRef(kind)
+  kindRef.current = kind
+  const tabRef = useRef(tab)
+  tabRef.current = tab
+  const [safetyOpen, setSafetyOpen] = useState(false)
+  const [shareOpen, setShareOpen] = useState(false)
+  const [dropActive, setDropActive] = useState(false)
+  const [dropBusy, setDropBusy] = useState(false)
+  // Редкие действия со списком (опознать, проверить, экспорт) — в меню «Ещё»:
+  // семь кнопок в ряд читались как одна серая полоса (аудит 22.09.2026).
+  const [moreMenu, setMoreMenu] = useState<{ x: number; y: number } | null>(null)
+  // Java, аргументы JVM и размер окна — для опытных, по умолчанию свёрнуты.
+  const [advanced, setAdvanced] = useState(false)
+
+  const loadMods = useCallback(
+    (k?: string) => {
+      const kk = k || kindRef.current
+      setSel(new Set())
+      setUpd({})
+      setItemLabels({})
+      if (!profile) return
+      if (useProfiles.getState().guarded.includes(profile)) {
+        setItems([])
+        setEmptyList(false)
+        setNoticeList('')
+        return
+      }
+      if (!hasTauri()) {
+        // Демо (?preview): список модов как в настоящей сборке, чтобы видеть экран целиком.
+        const demo = DEMO_USER && kk === 'mod' ? DEMO_MODS : []
+        setItems(demo)
+        setNoticeList(demo.length ? '' : 'Список появится в приложении')
+        setEmptyList(false)
+        return
+      }
+      setNoticeList('')
+      setOpenInfo('')
+      listContent(profile, kk)
+        .then((list) => {
+          setItems(list)
+          setEmptyList(!list.length)
+          if (list.some((i) => !i.scanned)) {
+            scanContentLocal(profile, kk)
+              .then((full) => {
+                if (kindRef.current === kk) setItems(full)
+              })
+              .catch(() => {})
+          }
+          checkUpdates(profile, kk)
+            .then((ups) => {
+              const m: Record<string, string> = {}
+              ;(ups || []).forEach((u) => (m[u.file_name] = u.new_version_number))
+              setUpd(m)
+            })
+            .catch(() => {})
+        })
+        .catch(() => {
+          setItems([])
+          setEmptyList(false)
+          setNoticeList('—')
+        })
+    },
+    [profile],
+  )
+
+  // A dependency the launcher knows how to close is not a question worth asking:
+  // the build is broken until it is installed, and the answer is always yes.
+  // Bounded rounds, because a freshly installed library may declare one of its
+  // own — and because a catalog that keeps offering a file that never satisfies
+  // the requirement must not loop forever.
+  const autoRound = useRef(0)
+
+  const runAudit = useCallback(
+    (auto: boolean, fix: boolean = auto) => {
+      if (!profile || !hasTauri() || useProfiles.getState().guarded.includes(profile)) return
+      setAuditBusy(true)
+      auditDeps(profile)
+        .then((r) => {
+          setAuditBusy(false)
+          setAudit(r)
+          if (!fix || autoRound.current >= AUTO_FIX_ROUNDS) return
+          const items = fixItems(r)
+          if (!items.length) return
+          autoRound.current += 1
+          installExtras(profile, 'mod', items, () => {
+            loadMods('mod')
+            runAuditRef.current(auto, fix)
+          })
+        })
+        .catch((e) => {
+          setAuditBusy(false)
+          if (!auto) showToast('Не удалось проверить: ' + e, 'error')
+        })
+    },
+    [profile, loadMods],
+  )
+
+  const runAuditRef = useRef(runAudit)
+  runAuditRef.current = runAudit
+
+  useEffect(() => {
+    if (!modal.open || !profile || !hasTauri()) {
+      autoRound.current = 0
+      return
+    }
+    autoRound.current = 0
+    runAuditRef.current(true)
+  }, [modal.open, profile])
+
+  const loadWorlds = useCallback(() => {
+    if (!profile) return
+    if (!hasTauri()) {
+      setServers([])
+      setWorldsNotice('Доступно в приложении')
+      return
+    }
+    setWorldsNotice('')
+    listServers(profile)
+      .then(setServers)
+      .catch(() => {})
+  }, [profile])
+
+  const loadLogs = useCallback(() => {
+    if (!profile || !hasTauri()) return
+    listLogs(profile)
+      .then((files) => {
+        setLogFiles(files)
+        if (!files.length) {
+          setLogFile('')
+          setLogBody('Логи появятся после первого запуска игры')
+          return
+        }
+        setLogFile(files[0])
+      })
+      .catch(() => {})
+  }, [profile])
+
+  useEffect(() => {
+    if (!profile || !logFile || !hasTauri()) return
+    readLog(profile, logFile).then((t) => setLogBody(t || '(пусто)'))
+  }, [profile, logFile])
+
+  useEffect(() => {
+    const b = logBodyRef.current
+    if (b) b.scrollTop = b.scrollHeight
+  }, [logBody])
+
+  // Rust streams the game stdout/stderr as "game-log"; "game-log-start" clears the buffer.
+  useEffect(() => {
+    let uns: Array<(() => void) | null> = []
+    listenGameLogStart(() => setLiveLines([])).then((u) => uns.push(u))
+    listenGameLog((lines) => setLiveLines((l) => [...l, ...lines].slice(-800))).then((u) => uns.push(u))
+    return () => uns.forEach((u) => u && u())
+  }, [])
+
+  useEffect(() => {
+    const b = liveRef.current
+    if (b) b.scrollTop = b.scrollHeight
+  }, [liveLines])
+
+  useEffect(() => {
+    if (!hasTauri() || !servers.length) return
+    let alive = true
+    servers.forEach((sv) => {
+      if (!sv.ip) return
+      pingServer(sv.ip)
+        .then((r) => alive && setPings((p) => ({ ...p, [sv.ip]: r })))
+        .catch(() => alive && setPings((p) => ({ ...p, [sv.ip]: null })))
+    })
+    return () => {
+      alive = false
+    }
+  }, [servers])
+
+  useEffect(() => {
+    if (!modal.open || !profile) return
+    const { tab: wantTab, focusRename, share: wantShare } = useInstance.getState()
+    setTab(wantTab)
+    if (wantTab === 'worlds') loadWorlds()
+    if (wantTab === 'logs') loadLogs()
+    // The rename input lives on the Settings tab, so focus is set after that
+    // tab has been rendered.
+    if (focusRename) {
+      requestAnimationFrame(() => {
+        const input = document.getElementById('bsRename') as HTMLInputElement | null
+        input?.focus()
+        input?.select()
+      })
+      useInstance.getState().set({ focusRename: false })
+    }
+    const shareLink = wantShare && useProfiles.getState().guarded.includes(profile)
+    setShareOpen(wantShare && !shareLink)
+    if (shareLink) shareCatalogLink(profile)
+    if (wantShare) useInstance.getState().set({ share: false })
+    setKind('mod')
+    setPlaytime('')
+    setRam(parseInt(localStorage.getItem(ramKey(profile)) || '4'))
+    setJavaList([])
+    setDetectLabel('Найти')
+    setShotCount('—')
+    setMpSlug('')
+    setMpVersion('')
+    setWFilter('all')
+    setWsName('')
+    setWsIp('')
+    setShareLabel('Поделиться')
+    setUpdateAllLabel('Обновить всё')
+    setRenameVal(profile)
+    try {
+      setNote(localStorage.getItem('m-note-' + profile) || '')
+    } catch {
+      setNote('')
+    }
+    if (hasTauri()) {
+      ensureMcVersionList().catch((e) =>
+        showToast('Список версий Minecraft не загрузился: ' + e + '. Проверь интернет и открой сборку заново', 'error'),
+      )
+      getPlayStats()
+        .then((s) => {
+          const b = s.builds.find((x) => x.key === profile)
+          if (!b || !b.seconds) return
+          setPlaytime(' · играно ' + fmtPlaytime(b.seconds) + (b.last ? ' · заходил ' + whenText(b.last) : ''))
+        })
+        .catch(() => {})
+      gpuSwitchSupported()
+        .then(setGpuOk)
+        .catch(() => setGpuOk(false))
+      fpsBoostState(profile)
+        .then(setBoost)
+        .catch(() => setBoost(null))
+      skinModState(profile)
+        .then(setSkinModState)
+        .catch(() => setSkinModState(null))
+      loadProfileSettings(profile)
+        .then((cfg) => {
+          setJvm(cfg.jvmArgs || '')
+          setW(cfg.width ? String(cfg.width) : '')
+          setH(cfg.height ? String(cfg.height) : '')
+          setJava(cfg.javaPath || '')
+          setJavaMajor(Number(cfg.javaMajor) || 0)
+          setGpu(cfg.gpu || 'auto')
+        })
+        .catch(() => {})
+      detectJava()
+        .then((list) => setJavaList(list))
+        .catch(() => {})
+      javaMajors()
+        .then(setJavaAll)
+        .catch(() => {})
+      countScreenshots(profile)
+        .then((n) => setShotCount(n ? n + ' шт.' : 'пока нет'))
+        .catch(() => {})
+      modpackInfo(profile)
+        .then((mp) => {
+          if (mp && mp.slug) {
+            setMpSlug(mp.slug)
+            setMpVersion(mp.versionId || '')
+          }
+        })
+        .catch(() => {})
+      getProfileGroups()
+        .then((g) => setGroup((g && g[profile]) || ''))
+        .catch(() => {})
+    }
+    loadMods('mod')
+  }, [modal.open, profile, loadMods])
+
+  useEffect(() => {
+    if (!pr) return
+    setNewLoader(loaderId(pr))
+    setNewLoaderVer(pr.loader_version || AUTO_LOADER_VERSION)
+    setNewVersion(pr.version)
+  }, [modal.open, profile, pr?.version, pr?.loader, pr?.fabric, pr?.loader_version])
+
+  const toggleBoost = async () => {
+    if (!profile) return
+    if (!hasTauri()) {
+      showToast('Буст FPS доступен в приложении', 'error')
+      return
+    }
+    const on = !(boost && boost.enabled)
+    setBoostBusy(true)
+    try {
+      const next = await setFpsBoost(profile, on)
+      setBoost(next)
+      loadMods()
+      if (!on) {
+        showToast('Буст FPS выключен — моды сняты, настройки графики вернули как было')
+      } else if (next.vanilla) {
+        showToast('Буст FPS включён: профиль JVM и лёгкая графика. Моды-ускорители работают только на Fabric/Forge.')
+      } else {
+        showToast(
+          'Буст FPS включён: ' +
+            next.mods.length +
+            ' мод(ов), профиль JVM и лёгкая графика' +
+            (next.skipped.length ? '. Без сборки под эту версию: ' + next.skipped.join(', ') : ''),
+        )
+      }
+    } catch (e) {
+      showToast('Не удалось переключить буст FPS: ' + e, 'error')
+    } finally {
+      setBoostBusy(false)
+    }
+  }
+
+  const toggleSkinMod = async () => {
+    if (!profile) return
+    const on = !skinMod?.on
+    setSkinModBusy(true)
+    try {
+      setSkinModState(await setSkinMod(profile, on))
+      loadMods()
+      showToast(
+        on
+          ? 'Мод скинов вернётся в сборку при следующем запуске'
+          : 'Мод скинов убран — лаунчер больше не будет добавлять его в эту сборку',
+      )
+    } catch (e) {
+      showToast('Не удалось переключить мод скинов: ' + e, 'error')
+    } finally {
+      setSkinModBusy(false)
+    }
+  }
+
+  const doRename = () => {
+    const nn = renameVal.trim()
+    if (!profile || !nn || nn === profile) return
+    if (!hasTauri()) {
+      showToast('Переименование доступно в приложении', 'error')
+      return
+    }
+    setRenameBusy(true)
+    renameProfile(profile, nn)
+      .then(() => {
+        for (const pfx of ['m-last-', 'm-ram-']) {
+          const v = localStorage.getItem(pfx + profile)
+          if (v !== null) {
+            localStorage.setItem(pfx + nn, v)
+            localStorage.removeItem(pfx + profile)
+          }
+        }
+        useInstance.getState().setProfile(nn)
+        useProfiles.getState().setSelected(nn)
+        void useProfiles.getState().refresh()
+        showToast('Сборка переименована в «' + nn + '»')
+      })
+      .catch((e) => showToast('Не удалось переименовать: ' + e, 'error'))
+      .finally(() => setRenameBusy(false))
+  }
+
+  const applyCore = async () => {
+    if (!profile || !pr) return
+    if (!hasTauri()) {
+      showToast('Доступно в приложении', 'error')
+      return
+    }
+    const ver = (newVersion || pr.version).trim()
+    const lver = hasLoaderVersions(newLoader) ? newLoaderVer : AUTO_LOADER_VERSION
+    if (ver === pr.version && newLoader === loaderId(pr) && lver === (pr.loader_version || AUTO_LOADER_VERSION)) {
+      showToast('Ничего не поменялось')
+      return
+    }
+    const label = (CORE_OPTS.find((c) => c[0] === newLoader)?.[1] || newLoader) + (lver ? ' ' + lver : '')
+    if (
+      !(await uiConfirm('Сменить сборку на ' + label + ' ' + ver + '? Установленные моды могут стать несовместимы — проверь их после смены.', {
+        confirmLabel: 'Сменить',
+      }))
+    )
+      return
+    setCoreBusy(true)
+    let modCount = 0
+    try {
+      if (hasTauri()) modCount = (await listContent(profile, 'mod')).length
+    } catch {}
+    setProfileLoader(profile, ver, newLoader, lver || null)
+      .then(() => {
+        void useProfiles.getState().refresh()
+        if (modCount > 0 && newLoader !== loaderId(pr)) {
+          showToast(
+            'Загрузчик сменили на ' + label + '. Проверь моды (' + modCount + ' шт.) — часть может не подойти.',
+          )
+        } else {
+          showToast('Готово: ' + label + ' · ' + ver + '. Доустановим при запуске.')
+        }
+      })
+      .catch((e) => showToast('Не удалось сменить: ' + e, 'error'))
+      .finally(() => setCoreBusy(false))
+  }
+
+  const applyGameUpdate = async (target: string) => {
+    if (!profile || !pr) return
+    const loader = loaderId(pr)
+    const lver = loaderPinFollowsGame(loader) ? pr.loader_version || null : null
+    setCoreBusy(true)
+    try {
+      const mods = await listContent(profile, 'mod')
+      const plan = mods.length ? await migratePlan(profile, target, loader) : null
+      const installed = new Map(mods.map((m) => [m.name.replace(/\.disabled$/, ''), m.version_number || '']))
+      const refit = plan ? plan.items.filter((i) => i.ok && installed.get(i.file_name) !== i.version_number) : []
+      const blocked = plan ? plan.items.filter((i) => !i.ok).map((i) => i.title) : []
+      const unchecked = plan ? plan.unlinked : []
+      const listed = (names: string[]) => names.slice(0, 5).join(', ') + (names.length > 5 ? ' и ещё ' + (names.length - 5) : '')
+      const text =
+        'Обновить Minecraft ' + pr.version + ' → ' + target + '?' +
+        (refit.length ? ' Моды под новую версию обновятся сами: ' + refit.length + ' шт.' : '') +
+        (blocked.length ? ' Нет сборки под ' + target + ': ' + listed(blocked) + ' — останутся как есть и могут не запуститься.' : '') +
+        (unchecked.length ? ' Не проверить, добавлены вручную: ' + listed(unchecked) + '.' : '')
+      if (!(await uiConfirm(text, { confirmLabel: 'Обновить' }))) return
+      await setProfileLoader(profile, target, loader, lver)
+      const failed: string[] = []
+      for (const i of refit) {
+        await updateContent(profile, 'mod', i.file_name).catch(() => failed.push(i.title))
+      }
+      void useProfiles.getState().refresh()
+      loadMods()
+      if (failed.length) {
+        showToast('Minecraft обновлён до ' + target + ', но не обновились моды: ' + listed(failed) + '. Обнови их на вкладке модов.', 'error')
+      } else {
+        showToast('Minecraft обновлён до ' + target + '. Доустановим при запуске.')
+      }
+    } catch (e) {
+      showToast('Не удалось обновить Minecraft: ' + e, 'error')
+    } finally {
+      setCoreBusy(false)
+    }
+  }
+
+  const applyLoaderUpdate = async (target: string) => {
+    if (!profile || !pr) return
+    const loader = loaderId(pr)
+    const label = LOADER_NAME(pr)
+    if (!(await uiConfirm('Обновить ' + label + ' ' + pr.loader_version + ' → ' + target + '?', { confirmLabel: 'Обновить' })))
+      return
+    setCoreBusy(true)
+    setProfileLoader(profile, pr.version, loader, target)
+      .then(() => {
+        void useProfiles.getState().refresh()
+        showToast(label + ' обновлён до ' + target + '. Доустановим при запуске.')
+      })
+      .catch((e) => showToast('Не удалось обновить загрузчик: ' + e, 'error'))
+      .finally(() => setCoreBusy(false))
+  }
+
+  const addFiles = useCallback(
+    async (paths: string[]) => {
+      const p = useInstance.getState().profile
+      if (!p) return
+      const k = kindRef.current
+      const accepted = (paths || []).filter((x) => acceptsFile(k, x))
+      const skipped = (paths || []).length - accepted.length
+      if (!accepted.length) {
+        showToast('Нужен файл ' + extsOf(k).map((e) => '.' + e).join(' / '), 'error')
+        return
+      }
+      setDropBusy(true)
+      showToast('Добавляем ' + accepted.length + ' файл(ов)…')
+      const errors = await Promise.all(
+        accepted.map((x) =>
+          addLocalFile(p, k, x).then(
+            () => '',
+            (e) => baseName(x) + ': ' + e,
+          ),
+        ),
+      ).finally(() => setDropBusy(false))
+      loadMods()
+      const failed = errors.filter(Boolean)
+      if (failed.length === accepted.length) {
+        showToast('Не удалось добавить: ' + failed[0], 'error')
+        return
+      }
+      if (failed.length) {
+        showToast('Добавлено ' + (accepted.length - failed.length) + ', с ошибкой ' + failed.length + ': ' + failed[0], 'error')
+        return
+      }
+      showToast('Добавлено в сборку: ' + accepted.length + (skipped ? ' · пропущено не по формату: ' + skipped : ''))
+    },
+    [loadMods],
+  )
+
+  useEffect(() => {
+    if (!modal.open) return
+    let unlistenDrop: (() => void) | null = null
+    let unlistenState: (() => void) | null = null
+    listenDragDrop((paths) => {
+      setDropActive(false)
+      if (!useUi.getState().modals.bsModal.open || tabRef.current !== 'content') return
+      if (useProfiles.getState().guarded.includes(useInstance.getState().profile || '')) return
+      void addFiles(paths || [])
+    }).then((u) => {
+      unlistenDrop = u
+    })
+    listenDragState((active) => {
+      const shut = useProfiles.getState().guarded.includes(useInstance.getState().profile || '')
+      setDropActive(active && !shut && useUi.getState().modals.bsModal.open && tabRef.current === 'content')
+    }).then((u) => {
+      unlistenState = u
+    })
+    return () => {
+      if (unlistenDrop) unlistenDrop()
+      if (unlistenState) unlistenState()
+      setDropActive(false)
+    }
+  }, [modal.open, addFiles])
+
+  if (!modal.open) return null
+
+  const saveOpts = () => {
+    if (!hasTauri() || !profile) return
+    saveProfileSettings(profile, jvm || '', +w || 0, +h || 0, java || '')
+      .then(() => {
+        if (java.trim()) setJavaMajor(0)
+      })
+      .catch((e) => {
+        trackFailure('build_settings', maskBuild(e, profile), { step: 'save' })
+        showToast('' + e, 'error')
+      })
+  }
+
+  const pinJavaMajor = (major: number) => {
+    if (!hasTauri() || !profile) return
+    if (!major) {
+      setJavaMajor(0)
+      setProfileJavaMajor(profile, null)
+        .then(() => showToast('Java для сборки снова выбирается автоматически'))
+        .catch((e) => showToast('' + e, 'error'))
+      return
+    }
+    if (!javaAll.includes(major)) {
+      showToast('Лаунчер ставит только Java ' + javaAll.join(', '), 'error')
+      return
+    }
+    setJavaBusy(major)
+    setProfileJavaMajor(profile, major)
+      .then((v) => {
+        setJavaMajor(major)
+        setJava('')
+        showToast('Сборка запускается на Java ' + major + ' · ' + v)
+      })
+      .catch((e) => showToast('' + e, 'error'))
+      .finally(() => setJavaBusy(0))
+  }
+
+  // The path field doubles as a version field: a bare number is what people type
+  // when the system Java cannot be reached at all, which is every Flatpak build.
+  const saveJavaField = () => {
+    const v = java.trim()
+    if (/^\d{1,3}$/.test(v)) {
+      pinJavaMajor(Number(v))
+      return
+    }
+    saveOpts()
+  }
+
+  const runScan = () => {
+    if (!hasTauri()) {
+      showToast('Доступно в приложении')
+      return
+    }
+    setScanLabel('Сканируем…')
+    scanContent(profile!, kind)
+      .then((r) => {
+        setScanLabel('Сканировать')
+        if (kindRef.current === kind) setItems(r.items)
+        showToast(
+          r.identified
+            ? 'Опознано ' +
+              r.identified +
+              ' из ' +
+              r.scanned +
+              ' (' +
+              [
+                r.modrinth ? 'Modrinth: ' + r.modrinth : '',
+                r.curseforge ? 'CurseForge: ' + r.curseforge : '',
+              ]
+                .filter(Boolean)
+                .join(', ') +
+              ')'
+            : 'Разобрано файлов: ' + r.scanned,
+        )
+      })
+      .catch((e) => {
+        setScanLabel('Сканировать')
+        showToast('Не удалось просканировать: ' + e, 'error')
+      })
+  }
+
+  const runExport = () => {
+    if (!hasTauri()) {
+      showToast('Доступно в приложении')
+      return
+    }
+    showToast('Собираем .mrpack…')
+    exportMrpack(profile!, profile!, '1.0.0', pr ? LOADER_NAME(pr) + ' ' + pr.version : '')
+      .then((p) => showToast('Экспортировано: ' + ('' + p).split('/').pop()))
+      .catch((e) => showToast('' + e))
+  }
+
+  const close = () => closeModal('bsModal')
+
+  const bulk = (names: string[], fn: (n: string) => Promise<unknown>, after?: () => void) =>
+    Promise.all(names.map(fn))
+      .then(() => {
+        setSel(new Set())
+        loadMods()
+        if (after) after()
+      })
+      .catch((e) => showToast(apiErrorText(e, 'Не удалось выполнить действие'), 'error'))
+
+  const filteredServers = wFilter !== 'single' ? servers : []
+  const serversEmpty = !worldsNotice && !filteredServers.length
+
+  const cq = contentQuery.trim().toLowerCase()
+  const shownItems = cq ? items.filter((i) => (i.title || i.name).toLowerCase().includes(cq)) : items
+
+  return (
+    <div
+      className={'modal-bg instance-page' + (modal.open ? ' open' : '') + (modal.vis ? ' vis' : '')}
+      id="bsModal"
+      onClick={(e) => {
+        if ((e.target as HTMLElement).id === 'bsModal') close()
+      }}
+    >
+      <div className="instance-shell">
+        <div className="inst-head">
+          <button className="inst-back" id="bsClose" data-sound="close" onClick={close}>
+            <Icon id="i-chev-l" /> К сборкам
+          </button>
+          <div className="inst-hero">
+            <div className="inst-icon" id="bsIconBig">
+              <BuildIcon icon={pr ? pr.icon : null} size={70} />
+            </div>
+            <div className="inst-titles">
+              <h1 id="bsTitle">{profile}</h1>
+              <div className="inst-sub" id="bsSub">
+                {(pr ? LOADER_NAME(pr) + ' · ' + pr.version : '—') + playtime}
+              </div>
+            </div>
+            <div className="inst-actions">
+              <button
+                className="btn lg secondary"
+                onClick={() => {
+                  if (!hasTauri()) {
+                    showToast('Доступно в приложении')
+                    return
+                  }
+                  if (guarded) {
+                    shareCatalogLink(profile!)
+                    return
+                  }
+                  setShareOpen(true)
+                }}
+              >
+                <Icon id="i-link" /> Поделиться
+              </button>
+              {thisRunning ? (
+                <button
+                  className="btn lg stop"
+                  id="bsPlay"
+                  data-track="stop_game"
+                  disabled={gameStopping}
+                  onClick={() => stopRunningGame(profile!)}
+                >
+                  <Icon id="i-power" /> {gameStopping ? 'Останавливаем…' : 'Остановить'}
+                </button>
+              ) : (
+                <button
+                  className="btn lg primary"
+                  id="bsPlay"
+                  onClick={() => {
+                    close()
+                    if (hasTauri()) realLaunch(profile!)
+                    else startPrelaunch(profile!)
+                  }}
+                >
+                  <Icon id="i-play" /> Играть
+                </button>
+              )}
+              {/* «⋯» — те же изменения, что на карточке «Мои сборки» (24.09.2026, 18:35). */}
+              <span className="inst-more-wrap">
+                <button
+                  type="button"
+                  className={'btn lg secondary inst-more' + (moreOpen ? ' on' : '')}
+                  aria-label="Управление сборкой"
+                  aria-expanded={moreOpen}
+                  data-track="build_menu"
+                  onClick={() => setMoreOpen((v) => !v)}
+                >
+                  <Icon id={moreOpen ? 'i-x' : 'i-dots'} />
+                </button>
+                {moreOpen && profile ? (
+                  <span className="ph-mine-menu inst-menu" role="menu">
+                    <BuildMenuItems
+                      name={profile}
+                      onClose={() => setMoreOpen(false)}
+                      onIcon={() => setPickIcon(true)}
+                      onRemoved={close}
+                      onTab={(t, rename) => {
+                        setTab(t)
+                        if (rename)
+                          requestAnimationFrame(() => {
+                            const input = document.getElementById('bsRename') as HTMLInputElement | null
+                            input?.focus()
+                            input?.select()
+                          })
+                      }}
+                    />
+                  </span>
+                ) : null}
+              </span>
+            </div>
+          </div>
+        </div>
+        <div className="inst-body">
+          <nav className="inst-tabs">
+            {[
+              ['content', 'i-blocks', 'Контент'],
+              ['worlds', 'i-server', 'Миры и серверы'],
+              ['shots', 'i-image', 'Скриншоты'],
+              ['logs', 'i-list', 'Логи'],
+              ['opts', 'i-settings', 'Параметры'],
+            ].map(([id, ic, label]) => (
+              <button
+                key={id}
+                className={'inst-tab' + (tab === id ? ' on' : '')}
+                data-bstab={id}
+                onClick={() => {
+                  setTab(id)
+                  if (id === 'worlds') loadWorlds()
+                  if (id === 'logs') loadLogs()
+                }}
+              >
+                <Icon id={ic} /> {label}
+                {id === 'shots' && /^\d/.test(shotCount) ? (
+                  <span className="nav-count" style={{ marginLeft: 'auto' }}>
+                    {parseInt(shotCount)}
+                  </span>
+                ) : null}
+              </button>
+            ))}
+          </nav>
+          <div className="inst-content">
+            {modal.open && profile ? <PackUpdateRow profile={profile} onUpdated={() => loadMods()} /> : null}
+            <div id="bsTabContent" style={{ display: tab === 'content' ? '' : 'none' }}>
+              {dlOpen && pr ? (
+                <ModDownloader
+                  build={pr}
+                  kind={kind}
+                  installed={items}
+                  onClose={() => setDlOpen(false)}
+                  onDone={(demo) => (demo ? setItems((l) => [...demo, ...l.filter((m) => !demo.some((d) => d.name === m.name))]) : loadMods())}
+                  onRemove={async (file) => {
+                    if (!hasTauri()) {
+                      setItems((l) => l.filter((m) => m.name !== file))
+                      showToast('Удалено из сборки', 'ok')
+                      return
+                    }
+                    await deleteContent(profile!, kind, file)
+                      .then(() => (loadMods(), showToast('Удалено из сборки', 'ok')))
+                      .catch((e) => showToast(apiErrorText(e, 'Не удалось удалить'), 'error'))
+                  }}
+                />
+              ) : null}
+              {guarded ? (
+                <div className="bx-mini-empty pr-locked" id="bsGuarded">
+                  <Icon id="i-lock" />
+                  <b>Эту сборку менять нельзя</b>
+                  <span>Моды в ней ставит сервер — так она всегда совпадает с ним</span>
+                  <button
+                    type="button"
+                    className="btn md primary"
+                    data-track="guarded_new_build"
+                    onClick={() => {
+                      close()
+                      openModal('nbModal')
+                    }}
+                  >
+                    <Icon id="i-plus" /> Своя сборка с модами
+                  </button>
+                </div>
+              ) : (
+              <>
+              <div className="segs" style={{ marginBottom: '12px' }}>
+                {KINDS.map(([k, label]) => (
+                  <button
+                    key={k}
+                    className={'seg' + (kind === k ? ' on' : '')}
+                    data-bskind={k}
+                    style={{ height: '32px', fontSize: '12.5px' }}
+                    onClick={() => {
+                      setKind(k)
+                      setAudit(null)
+                      loadMods(k)
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+                <span style={{ flex: 1 }}></span>
+                {items.length > 4 ? (
+                  <div className="input sm" style={{ width: '150px', height: '32px' }}>
+                    <Icon id="i-search" />
+                    <input placeholder="Поиск…" value={contentQuery} onChange={(e) => setContentQuery(e.target.value)} />
+                  </div>
+                ) : null}
+              </div>
+              <div className="pr-split">
+              {/* Действия сборки столбцом справа, как в Prism Launcher (владелец 07.10.2026). */}
+              <div className="act-row pr-acts">
+                <button className="btn md primary act-row-btn" id="bsAddContent" data-track="build_download" onClick={() => setDlOpen(true)}>
+                  <Icon id="i-plus" /> {ADD_LABEL[kind] || 'Добавить'}
+                </button>
+                <button
+                  className="btn sm secondary act-row-btn"
+                  id="bsDrop"
+                  disabled={dropBusy}
+                  onClick={() => {
+                    if (!hasTauri()) {
+                      showToast('Доступно в приложении', 'error')
+                      return
+                    }
+                    pickContentFiles(kindRef.current)
+                      .then((paths) => {
+                        if (paths && paths.length) void addFiles(paths)
+                      })
+                      .catch((e) => showToast('Не удалось открыть выбор файлов: ' + e, 'error'))
+                  }}
+                >
+                  <Icon id="i-upload" /> {dropBusy ? 'Добавляем…' : 'Из файла'}
+                </button>
+                <span className="pr-sep" />
+                <button
+                  className="btn sm secondary act-row-btn"
+                  data-bulk="enable"
+                  disabled={!sel.size}
+                  onClick={() => void bulk([...sel], (n) => toggleContent(profile!, kind, n, true))}
+                >
+                  <Icon id="i-check" /> Включить
+                </button>
+                <button
+                  className="btn sm secondary act-row-btn"
+                  data-bulk="disable"
+                  disabled={!sel.size}
+                  onClick={() => void bulk([...sel], (n) => toggleContent(profile!, kind, n, false))}
+                >
+                  <Icon id="i-ban" /> Выключить
+                </button>
+                <button
+                  className="btn sm danger act-row-btn"
+                  data-bulk="delete"
+                  disabled={!sel.size}
+                  onClick={async () => {
+                    const names = [...sel]
+                    if (await uiConfirm('Удалить выбранное (' + names.length + ')?', { confirmLabel: 'Удалить' }))
+                      void bulk(names, (n) => deleteContent(profile!, kind, n))
+                  }}
+                >
+                  <Icon id="i-trash" /> Удалить
+                </button>
+                <span className="pr-sep" />
+                <button
+                  className="btn sm secondary act-row-btn"
+                  id="bsUpdateAll"
+                  disabled={!Object.keys(upd).length}
+                  onClick={() => {
+                    if (!hasTauri()) return
+                    setUpdateAllLabel('Обновляем…')
+                    updateAll(profile!, kind)
+                      .then((n) => {
+                        setUpdateAllLabel('Обновить всё')
+                        loadMods()
+                        showToast(n ? 'Обновлено: ' + n : 'Всё актуально')
+                      })
+                      .catch((e) => {
+                        setUpdateAllLabel('Обновить всё')
+                        showToast('' + e)
+                      })
+                  }}
+                >
+                  <Icon id="i-restart" /> {updateAllLabel}
+                  {Object.keys(upd).length ? <span className="nav-count">{Object.keys(upd).length}</span> : null}
+                </button>
+                <button className="btn sm secondary act-row-btn" onClick={() => (hasTauri() ? void openProfileFolder(profile!) : showToast('Доступно в приложении'))}>
+                  <Icon id="i-folder" /> Открыть папку
+                </button>
+                <button
+                  className="btn sm ghost act-row-btn"
+                  id="bsMore"
+                  aria-label="Ещё"
+                  onClick={(e) => {
+                    const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                    setMoreMenu({ x: r.left, y: r.bottom + 4 })
+                  }}
+                >
+                  <Icon id="i-dots" /> Ещё
+                </button>
+                {moreMenu ? (
+                  <ContextMenu
+                    x={moreMenu.x}
+                    y={moreMenu.y}
+                    onClose={() => setMoreMenu(null)}
+                    items={
+                      [
+                        items.length && scanLabel === 'Сканировать'
+                          ? { id: 'scan', label: 'Опознать файлы', icon: 'i-search', onPick: runScan }
+                          : null,
+                        kind === 'mod' && items.length
+                          ? { id: 'safety', label: 'Проверить безопасность', icon: 'i-shield', onPick: () => setSafetyOpen(true) }
+                          : null,
+                        { id: 'export', label: 'Экспорт в .mrpack', icon: 'i-download', onPick: runExport },
+                      ].filter(Boolean) as ContextItem[]
+                    }
+                  />
+                ) : null}
+              </div>
+              <div className="pr-main">
+              {kind === 'mod' ? (
+                <div className={'bx-audit' + (audit && audit.issues.length ? ' bad' : audit ? ' ok' : '')}>
+                  <div className="bx-audit-row">
+                    <Icon id={audit && audit.issues.length ? 'i-alert' : 'i-shield'} />
+                    <span className="bx-audit-text">
+                      {auditBusy
+                        ? 'Проверяем совместимость…'
+                        : !audit
+                          ? 'Совместимость'
+                          : !audit.issues.length
+                            ? 'Всё совместимо · ' + audit.checked + ' файлов'
+                            : 'Проблем: ' + audit.issues.length}
+                    </span>
+                    <span style={{ flex: 1 }}></span>
+                    {fixItems(audit).length ? (
+                      <button
+                        className="btn sm primary"
+                        onClick={() =>
+                          installExtras(profile!, 'mod', fixItems(audit), () => {
+                            loadMods('mod')
+                            runAuditRef.current(false)
+                          })
+                        }
+                      >
+                        Доустановить ({fixItems(audit).length})
+                      </button>
+                    ) : null}
+                    <button
+                      className="btn sm ghost"
+                      disabled={auditBusy}
+                      onClick={() => {
+                        if (!hasTauri()) {
+                          showToast('Доступно в приложении')
+                          return
+                        }
+                        autoRound.current = 0
+                        runAudit(false, true)
+                      }}
+                    >
+                      <Icon id="i-restart" /> {auditBusy ? 'Проверяем…' : 'Проверить'}
+                    </button>
+                  </div>
+                  {!audit || !audit.issues.length ? null : (
+                    <div style={{ marginTop: '8px', maxHeight: '260px', overflowY: 'auto' }}>
+                      {audit.issues.map((it: AuditIssue, i) => (
+                        <div className="mod-card" key={it.kind + it.title + it.detail + i} style={{ marginBottom: '6px' }}>
+                          <div className="mod-card-row">
+                            <span className="mod-art">
+                              <Icon id={it.kind === 'missing' ? 'i-download' : 'i-alert'} />
+                            </span>
+                            <span className="mod-card-body">
+                              <span className="mod-card-title">
+                                {it.title}
+                                <span
+                                  className="mod-upd"
+                                  style={
+                                    it.kind === 'missing'
+                                      ? undefined
+                                      : { background: 'var(--m-danger-soft)', color: 'var(--m-danger)' }
+                                  }
+                                >
+                                  {AUDIT_LABEL[it.kind]}
+                                </span>
+                              </span>
+                              <span className="mod-card-sub">{it.detail}</span>
+                            </span>
+                            {issueInstall(it) ? (
+                              <button
+                                className="btn sm secondary"
+                                style={{ height: '26px' }}
+                                onClick={() =>
+                                  installExtras(profile!, 'mod', [issueInstall(it)!], () => {
+                                    loadMods('mod')
+                                    runAuditRef.current(false)
+                                  })
+                                }
+                              >
+                                Поставить
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : null}
+              <div className="mod-list-head pr-thead">
+                <span className="set-val" id="bsModCount">
+                  {noticeList ? '' : shownItems.length ? shownItems.length + ' шт.' : ''}
+                </span>
+                {shownItems.length ? (
+                  <>
+                    <span className="pr-th pr-th-src">Источник</span>
+                    <span className="pr-th pr-th-on">Вкл</span>
+                  </>
+                ) : null}
+              </div>
+              <div className="mod-list-wrap">
+                {dropActive ? (
+                  <div className="mod-drop">
+                    <Icon id="i-upload" />
+                    <b>Отпусти — добавим в сборку</b>
+                    <span>{extsOf(kind).map((e) => '.' + e).join(' / ')}</span>
+                  </div>
+                ) : null}
+              <div id="bsMods" style={{ maxHeight: '340px', overflowY: 'auto' }}>
+                {noticeList ? (
+                  <p className="faint-note">{noticeList}</p>
+                ) : emptyList ? (
+                  <div className="bx-mini-empty">
+                    <Icon id={KIND_ICON[kind]} />
+                    <b>Пока пусто</b>
+                    <span>Перетащи {extsOf(kind).map((e) => '.' + e).join(' / ')} сюда</span>
+                  </div>
+                ) : !shownItems.length ? (
+                  <p className="faint-note">Ничего по «{contentQuery.trim()}»</p>
+                ) : (
+                  shownItems.map((md) => {
+                    const up = upd[md.name]
+                    const title = md.title || md.name.replace(/\.(jar|zip)$/, '')
+                    const info = openInfo === md.name
+                    const modrinth = md.project_id && !md.project_id.startsWith('cf:') ? md.project_id : ''
+                    const curse = md.project_id && md.project_id.startsWith('cf:') ? md.project_id.slice(3) : ''
+                    const facts = [
+                      md.version_number ? 'версия ' + md.version_number : '',
+                      md.mc ? 'MC ' + md.mc : '',
+                      md.author ? 'автор: ' + md.author : '',
+                      md.loaders?.length ? md.loaders.join(' · ') : md.loader || '',
+                      fmtSize(md.size),
+                    ].filter(Boolean)
+                    return (
+                      <div className={'mod-card' + (md.enabled ? '' : ' off') + (info ? ' open' : '')} key={md.name}>
+                        {/* Двойной клик по строке — включить/выключить, как в Prism. */}
+                        <div
+                          className="mod-card-row"
+                          onDoubleClick={(e) => {
+                            if ((e.target as HTMLElement).closest('button, .tgl, .chk')) return
+                            toggleContent(profile!, kind, md.name, !md.enabled)
+                              .then(() => loadMods())
+                              .catch((er) => showToast(apiErrorText(er, 'Не удалось выполнить действие'), 'error'))
+                          }}
+                        >
+                          <span
+                            className={'chk mod-sel' + (sel.has(md.name) ? ' on' : '')}
+                            data-sel={md.name}
+                            role="checkbox"
+                            aria-checked={sel.has(md.name)}
+                            onClick={() => {
+                              const next = new Set(sel)
+                              if (next.has(md.name)) next.delete(md.name)
+                              else next.add(md.name)
+                              setSel(next)
+                            }}
+                          ></span>
+                          <span className="mod-art">
+                            {md.icon_url ? <img src={mirrorAsset(md.icon_url)} alt="" loading="lazy" /> : <Icon id={KIND_ICON[kind]} />}
+                          </span>
+                          <span className="mod-card-body">
+                            <span className="mod-card-title">
+                              {title}
+                              {md.version_number ? <span className="mod-ver">{md.version_number}</span> : null}
+                              {incompatibleWith(md.mc, pr ? pr.version : '') ? (
+                                <span
+                                  className="mod-upd"
+                                  style={{ background: 'var(--m-danger-soft)', color: 'var(--m-danger)' }}
+                                >
+                                  для {md.mc}
+                                </span>
+                              ) : null}
+                            </span>
+                            <span className="mod-card-sub">{md.description || md.name}</span>
+                          </span>
+                          {up ? (
+                            <button
+                              className="btn sm primary"
+                              data-upd={md.name}
+                              style={{ height: '26px' }}
+                              onClick={() => {
+                                setItemLabels((l) => ({ ...l, [md.name]: '…' }))
+                                updateContent(profile!, kind, md.name)
+                                  .then(() => {
+                                    loadMods()
+                                    showToast('Обновлено')
+                                  })
+                                  .catch((er) => {
+                                    loadMods()
+                                    showToast('' + er)
+                                  })
+                              }}
+                            >
+                              {itemLabels[md.name] || (
+                                <>
+                                  <Icon id="i-arrow-up" /> Обновить
+                                </>
+                              )}
+                            </button>
+                          ) : null}
+                          <span className="mod-src">{modrinth ? 'Modrinth' : curse ? 'CurseForge' : 'Файл'}</span>
+                          <button
+                            className={'icon-btn mod-info' + (info ? ' on' : '')}
+                            aria-label="Подробнее"
+                            onClick={() => setOpenInfo(info ? '' : md.name)}
+                          >
+                            <Icon id="i-info" />
+                          </button>
+                          <span
+                            className={'tgl' + (md.enabled ? ' on' : '')}
+                            data-tg={md.name}
+                            role="switch"
+                            aria-checked={md.enabled}
+                            onClick={() => {
+                              // Отказ ядра обязан доехать до игрока: пока `.then`
+                              // стоял без пары, переключение мода при запущенной
+                              // игре молча роняло промис, тумблер оставался как
+                              // был, а причину видели только мы в журнале ошибок.
+                              toggleContent(profile!, kind, md.name, !md.enabled)
+                                .then(() => loadMods())
+                                .catch((e) => showToast(apiErrorText(e, 'Не удалось выполнить действие'), 'error'))
+                            }}
+                          ></span>
+                          <button
+                            className="icon-btn del"
+                            data-del={md.name}
+                            aria-label="Удалить"
+                            onClick={async () => {
+                              if (await uiConfirm('Удалить ' + md.name + '?', { confirmLabel: 'Удалить' }))
+                                deleteContent(profile!, kind, md.name)
+                                  .then(() => loadMods())
+                                  .catch((e) => showToast(apiErrorText(e, 'Не удалось выполнить действие'), 'error'))
+                            }}
+                          >
+                            <Icon id="i-trash" />
+                          </button>
+                        </div>
+                        {info ? (
+                          <div className="mod-card-info">
+                            {md.description ? <p className="mod-card-desc">{md.description}</p> : null}
+                            {facts.length ? (
+                              <div className="mod-card-facts">
+                                {facts.map((f) => (
+                                  <span className="pill" key={f}>
+                                    {f}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : null}
+                            <div className="mod-card-file">{md.name}</div>
+                            <div className="mod-card-acts">
+                              {md.project_id ? (
+                                <ModVersionPick
+                                  profile={profile!}
+                                  kind={kind}
+                                  file={md.name}
+                                  current={md.version_number || ''}
+                                  onChanged={() => loadMods()}
+                                />
+                              ) : null}
+                              {modrinth ? (
+                                <button className="btn sm secondary" onClick={() => openProject(modrinth, kind)}>
+                                  <Icon id="i-ext" /> Modrinth
+                                </button>
+                              ) : null}
+                              {curse ? (
+                                <button
+                                  className="btn sm secondary"
+                                  onClick={() => openUrl('https://www.curseforge.com/projects/' + curse)}
+                                >
+                                  <Icon id="i-ext" /> CurseForge
+                                </button>
+                              ) : null}
+                              {!md.project_id ? (
+                                <button
+                                  className="btn sm secondary"
+                                  disabled={scanLabel !== 'Сканировать'}
+                                  onClick={runScan}
+                                >
+                                  <Icon id="i-search" /> {scanLabel === 'Сканировать' ? 'Найти в каталогах' : scanLabel}
+                                </button>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    )
+                  })
+                )}
+              </div>
+              </div>
+              </div>
+              </div>
+              </>
+              )}
+            </div>
+
+            <div id="bsTabWorlds" style={{ display: tab === 'worlds' ? '' : 'none' }}>
+              <div className="segs" style={{ marginBottom: '12px' }}>
+                {[
+                  ['all', 'Все'],
+                  ['single', 'Одиночные'],
+                  ['server', 'Серверы'],
+                ].map(([k, label]) => (
+                  <button
+                    key={k}
+                    className={'seg' + (wFilter === k ? ' on' : '')}
+                    data-wfilter={k}
+                    style={{ height: '32px', fontSize: '12.5px' }}
+                    onClick={() => {
+                      setWFilter(k)
+                      loadWorlds()
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {wFilter !== 'server' ? (
+                <WorldManager
+                  profile={profile!}
+                  onPlay={(folder, name) => {
+                    close()
+                    showToast('Заходим в мир «' + name + '»…')
+                    joinWithAuth(profile!, folder, null).catch((e) => showLaunchError(e))
+                  }}
+                />
+              ) : null}
+              <div id="bsWorlds" style={{ maxHeight: '250px', overflowY: 'auto' }}>
+                {worldsNotice ? (
+                  <p className="faint-note">{worldsNotice}</p>
+                ) : serversEmpty ? (
+                  wFilter === 'server' ? <p className="faint-note">Серверов пока нет</p> : null
+                ) : (
+                  <>
+                    {filteredServers.map((s2) => {
+                      const pg = pings[s2.ip]
+                      const online = pg && pg.online >= 0 && (pg.max > 0 || pg.online > 0 || pg.version)
+                      return (
+                      <div className="mod-line srv-line" key={'s' + s2.ip}>
+                        <span className="mod-mini">
+                          <Icon id="i-server" />
+                        </span>
+                        <span className="srv-line-body">
+                          <b>
+                            {s2.name}
+                            {pg === undefined ? (
+                              <span className="srv-ping-dot loading"></span>
+                            ) : online ? (
+                              <span className="srv-ping-dot on"></span>
+                            ) : (
+                              <span className="srv-ping-dot off"></span>
+                            )}
+                          </b>
+                          <span className="srv-line-meta">
+                            {online ? (
+                              <>
+                                {pg!.online}/{pg!.max} онлайн{pg!.version ? ' · ' + pg!.version : ''}
+                                {pg!.motd ? ' · ' + pg!.motd.slice(0, 40) : ''}
+                              </>
+                            ) : pg === undefined ? (
+                              'проверяем…'
+                            ) : (
+                              s2.ip + ' · офлайн'
+                            )}
+                          </span>
+                        </span>
+                        <button
+                          className="btn sm primary w-join"
+                          data-ip={s2.ip}
+                          style={{ marginLeft: '8px' }}
+                          onClick={() => {
+                            close()
+                            showToast('Подключаемся к ' + s2.ip + '…')
+                            joinWithAuth(profile!, null, s2.ip, s2.name).catch((e) => showLaunchError(e))
+                          }}
+                        >
+                          <Icon id="i-play" /> Играть
+                        </button>
+                        <button
+                          className="icon-btn del w-del"
+                          aria-label="Удалить сервер"
+                          data-ip={s2.ip}
+                          onClick={() => removeServer(profile!, s2.ip).then(() => loadWorlds())}
+                        >
+                          <Icon id="i-trash" />
+                        </button>
+                      </div>
+                      )
+                    })}
+                  </>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+                <div className="input sm" style={{ flex: 1 }}>
+                  <input
+                    id="wsName"
+                    placeholder="Название"
+                    value={wsName}
+                    onChange={(e) => setWsName(e.target.value)}
+                  />
+                </div>
+                <div className="input sm" style={{ flex: 1 }}>
+                  <input
+                    id="wsIp"
+                    placeholder="mc.example.net"
+                    value={wsIp}
+                    onChange={(e) => setWsIp(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') (document.getElementById('wsAdd') as HTMLButtonElement | null)?.click()
+                    }}
+                  />
+                </div>
+                <button
+                  className="btn sm secondary"
+                  id="wsAdd"
+                  onClick={() => {
+                    const n = wsName.trim() || wsIp.trim()
+                    const ip = wsIp.trim()
+                    if (!ip) return
+                    addServer(profile!, n, ip).then(() => {
+                      setWsName('')
+                      setWsIp('')
+                      loadWorlds()
+                      showToast('Сервер добавлен')
+                    })
+                  }}
+                >
+                  <Icon id="i-plus" /> Сервер
+                </button>
+              </div>
+              <button
+                className="btn sm secondary"
+                id="bsAddWorld"
+                style={{ width: '100%', marginTop: '8px' }}
+                onClick={() => {
+                  useProfiles.getState().setSelected(profile)
+                  close()
+                  setScreen('mods')
+                  useMods.getState().scopeTo(profile)
+                  useMods.getState().set({ modTab: 'world', fCat: 'все' })
+                  void useMods.getState().load()
+                }}
+              >
+                <Icon id="i-map" /> Карты из каталога
+              </button>
+            </div>
+
+            {tab === 'shots' ? (
+              <div id="bsTabShots">
+                <ScreenshotGallery profile={profile!} />
+              </div>
+            ) : null}
+
+            <div id="bsTabLogs" style={{ display: tab === 'logs' ? '' : 'none' }}>
+              <div className="segs" style={{ marginBottom: '10px', width: 'auto' }}>
+                <button
+                  className={'seg' + (logView === 'live' ? ' on' : '')}
+                  style={{ height: '32px', fontSize: '12.5px' }}
+                  onClick={() => setLogView('live')}
+                >
+                  <Icon id="i-list" /> Консоль
+                  {liveLines.length ? <span className="log-live-dot"></span> : null}
+                </button>
+                <button
+                  className={'seg' + (logView === 'files' ? ' on' : '')}
+                  style={{ height: '32px', fontSize: '12.5px' }}
+                  onClick={() => setLogView('files')}
+                >
+                  <Icon id="i-book" /> Файлы
+                </button>
+              </div>
+
+              {logView === 'live' ? (
+                <>
+                  <pre ref={liveRef} className="host-console" style={{ height: '300px', margin: 0 }}>
+                    {liveLines.length ? (
+                      liveLines.map((l, i) => <div key={i}>{l}</div>)
+                    ) : (
+                      <div className="faint-note">Запусти игру — вывод появится здесь</div>
+                    )}
+                  </pre>
+                  <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+                    <button className="btn sm secondary" style={{ flex: 1 }} onClick={() => setLiveLines([])}>
+                      <Icon id="i-trash" /> Очистить
+                    </button>
+                    <button
+                      className="btn sm secondary"
+                      style={{ flex: 1 }}
+                      onClick={() => {
+                        void copyText(liveLines.join('\n')).then((ok) =>
+                          showToast(ok ? 'Консоль скопирована' : 'Не удалось скопировать консоль'),
+                        )
+                      }}
+                    >
+                      <Icon id="i-copy" /> Скопировать
+                    </button>
+                  </div>
+                </>
+              ) : null}
+
+              <div style={{ display: logView === 'files' ? '' : 'none' }}>
+                {logFiles.length ? (
+                  <div className="log-files">
+                    {logFiles.map((f) => (
+                      <button
+                        key={f}
+                        className={'log-file-chip' + (f === logFile ? ' on' : '')}
+                        onClick={() => setLogFile(f)}
+                      >
+                        {f}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                <pre
+                  id="bsLogBody"
+                  ref={logBodyRef}
+                  style={{
+                    maxHeight: '280px',
+                    overflow: 'auto',
+                    background: 'var(--m-inset)',
+                    borderRadius: '12px',
+                    padding: '12px',
+                    fontFamily: 'var(--m-mono)',
+                    fontSize: '11.5px',
+                    lineHeight: 1.5,
+                    whiteSpace: 'pre-wrap',
+                    color: 'var(--m-fg-muted)',
+                  }}
+                >
+                  {logBody}
+                </pre>
+                <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+                <button
+                  className="btn sm secondary"
+                  id="bsLogCopy"
+                  style={{ flex: 1 }}
+                  onClick={() => {
+                    void copyText(logBody)
+                    showToast('Лог скопирован')
+                  }}
+                >
+                  <Icon id="i-copy" /> Скопировать
+                </button>
+                <button
+                  className="btn sm secondary"
+                  id="bsLogShare"
+                  style={{ flex: 1 }}
+                  onClick={() => {
+                    if (!hasTauri()) {
+                      showToast('Доступно в приложении')
+                      return
+                    }
+                    const name = logFiles.length ? logFile : 'нет логов'
+                    if (!name || name === 'нет логов') {
+                      showToast('Нет лога для отправки')
+                      return
+                    }
+                    setShareLabel('Загружаем…')
+                    shareLog(profile!, name)
+                      .then((url) => {
+                        setShareLabel('Поделиться')
+                        void copyText(url)
+                        showToast('Ссылка на лог скопирована: ' + url)
+                        openUrl(url)
+                      })
+                      .catch((e) => {
+                        setShareLabel('Поделиться')
+                        showToast('' + e)
+                      })
+                  }}
+                >
+                  <Icon id="i-link" /> {shareLabel}
+                </button>
+              </div>
+              </div>
+            </div>
+
+            <div id="bsTabOpts" style={{ display: tab === 'opts' ? '' : 'none' }}>
+              <div className="bx-opts-cap">Сборка</div>
+              <div className="set-row">
+                <span className="lab">
+                  Название
+                </span>
+                <div className="input sm" style={{ width: '220px' }}>
+                  <input
+                    id="bsRename"
+                    maxLength={BUILD_NAME_MAX}
+                    value={renameVal}
+                    placeholder="Название"
+                    onChange={(e) => setRenameVal(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') doRename()
+                    }}
+                  />
+                </div>
+                <button
+                  className="btn sm secondary"
+                  disabled={renameBusy || !renameVal.trim() || renameVal.trim() === profile}
+                  onClick={doRename}
+                >
+                  {renameBusy ? 'Переименовываем…' : 'Переименовать'}
+                </button>
+              </div>
+              <div className="set-row" style={{ alignItems: 'flex-start' }}>
+                <span className="lab">
+                  Версия и загрузчик
+                </span>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '300px' }}>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <Select
+                      width={148}
+                      value={newLoader}
+                      options={CORE_OPTS.map(([v, label]) => ({ value: v, label }))}
+                      onChange={(v) => {
+                        setNewLoader(v)
+                        setNewLoaderVer(AUTO_LOADER_VERSION)
+                      }}
+                    />
+                    <Select
+                      width={144}
+                      value={newVersion}
+                      options={verOpts}
+                      onChange={(v) => {
+                        setNewVersion(v)
+                        setNewLoaderVer(AUTO_LOADER_VERSION)
+                      }}
+                    />
+                  </div>
+                  {hasLoaderVersions(newLoader) ? (
+                    <Select
+                      width={300}
+                      value={newLoaderVer}
+                      options={lb.withPinned(newLoaderVer)}
+                      disabled={lb.loading}
+                      placeholder={lb.loading ? 'Загружаем версии загрузчика…' : 'Рекомендуемая'}
+                      onChange={setNewLoaderVer}
+                    />
+                  ) : null}
+                  <button
+                    className="btn sm primary"
+                    style={{ alignSelf: 'flex-start' }}
+                    disabled={
+                      coreBusy ||
+                      (newVersion === (pr ? pr.version : '') &&
+                        newLoader === (pr ? loaderId(pr) : '') &&
+                        newLoaderVer === (pr ? pr.loader_version || AUTO_LOADER_VERSION : ''))
+                    }
+                    onClick={() => void applyCore()}
+                  >
+                    {coreBusy ? 'Меняем…' : 'Сменить'}
+                  </button>
+                  {pr && (coreUpd.mc || coreUpd.loader) ? (
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      {coreUpd.mc ? (
+                        <button
+                          className="btn sm secondary"
+                          disabled={coreBusy || thisRunning}
+                          onClick={() => coreUpd.mc && void applyGameUpdate(coreUpd.mc)}
+                        >
+                          Обновить Minecraft до {coreUpd.mc}
+                        </button>
+                      ) : null}
+                      {coreUpd.loader ? (
+                        <button
+                          className="btn sm secondary"
+                          disabled={coreBusy || thisRunning}
+                          onClick={() => coreUpd.loader && void applyLoaderUpdate(coreUpd.loader)}
+                        >
+                          Обновить {LOADER_NAME(pr)} до {coreUpd.loader}
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <div className="set-row" style={{ alignItems: 'flex-start' }}>
+                <span className="lab">
+                  Иконка
+                </span>
+                <div style={{ width: '340px' }}>
+                  <IconGrid
+                    id="bsIcons"
+                    current={pr ? pr.icon : null}
+                    style={{ width: '100%', gridTemplateColumns: 'repeat(7,1fr)', maxHeight: '140px' }}
+                    onPick={(v) => {
+                      if (hasTauri() && profile)
+                        setProfileIcon(profile, v).then(() => {
+                          void useProfiles.getState().refresh()
+                          showToast('Иконка обновлена')
+                        })
+                    }}
+                  />
+                  <div style={{ display: 'flex', gap: '6px', marginTop: '8px', alignItems: 'center' }}>
+                    {customCover ? (
+                      <img
+                        src={customCover}
+                        alt=""
+                        width={32}
+                        height={32}
+                        style={{ borderRadius: '8px', objectFit: 'cover', flex: '0 0 auto' }}
+                      />
+                    ) : null}
+                    <button
+                      className="btn sm secondary"
+                      id="bsIconBuild"
+                      style={{ flex: 1 }}
+                      data-sound="open"
+                      onClick={() => setIconEditor(true)}
+                    >
+                      <Icon id="i-brush" /> Собрать
+                    </button>
+                    <button
+                      className="btn sm secondary"
+                      id="bsCoverPick"
+                      style={{ flex: 1 }}
+                      onClick={() => {
+                        if (!hasTauri()) {
+                          showToast('Доступно в приложении')
+                          return
+                        }
+                        if (!profile) return
+                        pickProfileCover(profile)
+                          .then((all) => {
+                            if (!all) return
+                            void useProfiles.getState().refresh()
+                            showToast('Обложка обновлена')
+                          })
+                          .catch((e) => showToast('' + e, 'error'))
+                      }}
+                    >
+                      <Icon id="i-image" /> Картинка
+                    </button>
+                    {customCover ? (
+                      <button
+                        className="btn sm secondary"
+                        id="bsCoverClear"
+                        onClick={() => {
+                          if (!hasTauri() || !profile) return
+                          clearProfileCover(profile).then(() => {
+                            void useProfiles.getState().refresh()
+                            showToast('Вернули блок Millida')
+                          })
+                        }}
+                      >
+                        Убрать
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+              <div className="set-row">
+                <span className="lab">
+                  Группа
+                </span>
+                <div className="input sm" style={{ width: '180px' }}>
+                  <input
+                    id="bsGroup"
+                    placeholder="Технические"
+                    maxLength={GROUP_NAME_MAX}
+                    value={group}
+                    onChange={(e) => setGroup(e.target.value)}
+                    onBlur={() => {
+                      if (!hasTauri() || !profile) return
+                      const g = group.trim()
+                      setProfileGroup(profile, g).then(() => {
+                        void useProfiles.getState().refresh()
+                        showToast(g ? 'Группа: ' + g : 'Убрано из группы')
+                      })
+                    }}
+                  />
+                </div>
+              </div>
+              <div className="set-row" style={{ alignItems: 'flex-start' }}>
+                <span className="lab">
+                  Заметка
+                </span>
+                <div className="input sm" style={{ width: '300px' }}>
+                  <input
+                    id="bsNote"
+                    placeholder="Для игры с друзьями"
+                    value={note}
+                    maxLength={200}
+                    onChange={(e) => setNote(e.target.value)}
+                    onBlur={() => {
+                      try {
+                        if (profile) {
+                          if (note.trim()) localStorage.setItem('m-note-' + profile, note.trim())
+                          else localStorage.removeItem('m-note-' + profile)
+                        }
+                      } catch {}
+                    }}
+                  />
+                </div>
+              </div>
+              <div className="set-row" id="bsModpackRow" style={{ display: mpSlug ? '' : 'none' }}>
+                <span className="lab">
+                  Версия модпака
+                </span>
+                <button
+                  className="btn sm secondary"
+                  id="bsModpackUpd"
+                  onClick={() => useModpackVersions.getState().open(profile!, mpSlug, mpVersion)}
+                >
+                  Версии
+                </button>
+              </div>
+              {profile ? <PackAutoUpdateRow profile={profile} /> : null}
+              <div className="bx-opts-cap">Игра</div>
+              <div className="set-row">
+                <span className="lab">
+                  Память
+                  {ramMax < RAM_MAX_GB ? <small>{`Максимум ${ramMax} ГБ — остальное нужно системе`}</small> : null}
+                </span>
+                <span className="set-val" id="bsRamVal">
+                  {ram + ' ГБ'}
+                </span>
+                <Slider
+                  width={200}
+                  min={1}
+                  max={ramMax}
+                  value={ram}
+                  onChange={(v) => {
+                    setRam(v)
+                    if (profile) localStorage.setItem(ramKey(profile), String(v))
+                  }}
+                />
+              </div>
+              <TunePanel profile={profile!} manualGb={ram} />
+              <div className="set-row">
+                <span className="lab">
+                  Видеокарта
+                  {!gpuOk ? <small>Здесь карту выбирает система</small> : null}
+                </span>
+                <Select
+                  width={230}
+                  value={gpu}
+                  disabled={!gpuOk}
+                  options={[
+                    { value: 'auto', label: 'Авто', sub: 'Как решит система' },
+                    { value: 'discrete', label: 'Дискретная', sub: 'NVIDIA или AMD — больше FPS' },
+                    { value: 'integrated', label: 'Встроенная', sub: 'Тише и дольше от батареи' },
+                  ]}
+                  onChange={(v) => {
+                    if (!profile) return
+                    const prev = gpu
+                    setGpu(v as GpuPref)
+                    setProfileGpu(profile, v as GpuPref)
+                      .then((saved) => {
+                        setGpu(saved)
+                        showToast(
+                          saved === 'discrete'
+                            ? 'Запускаем на дискретной карте'
+                            : saved === 'integrated'
+                              ? 'Запускаем на встроенной карте'
+                              : 'Карту выбирает система',
+                        )
+                      })
+                      .catch((e) => {
+                        setGpu(prev)
+                        showToast('Не удалось сохранить выбор карты: ' + e, 'error')
+                      })
+                  }}
+                />
+              </div>
+              {boost && boost.applicable === false && !boost.enabled ? null : (
+              <div className="set-row">
+                <span className="lab">
+                  Буст FPS
+                  <small>
+                    {boost && boost.enabled && boost.skipped.length
+                      ? 'Нет под эту версию: ' + boost.skipped.join(', ')
+                      : boost && boost.vanilla
+                        ? 'Java и графика; моды — на Fabric/Forge'
+                        : 'Sodium, настройки Java и лёгкая графика'}
+                  </small>
+                </span>
+                <span
+                  className={'tgl' + (boost && boost.enabled ? ' on' : '') + (boostBusy ? ' busy' : '')}
+                  data-fpsboost={boost && boost.enabled ? 'on' : 'off'}
+                  role="switch"
+                  aria-checked={!!(boost && boost.enabled)}
+                  aria-label="Буст FPS"
+                  onClick={() => {
+                    if (!boostBusy) void toggleBoost()
+                  }}
+                ></span>
+              </div>
+              )}
+              {pr && loaderId(pr) !== 'vanilla' ? (
+                <div className="set-row">
+                  <span className="lab">
+                    Скин Millida в игре
+                    <small>
+                      {skinMod?.conflict
+                        ? 'Уже есть свой мод скинов: ' + skinMod.conflict
+                        : skinMod?.on
+                          ? 'Твой скин видно на серверах'
+                          : 'Включи, если скин не виден в игре'}
+                    </small>
+                  </span>
+                  <span
+                    className={'tgl' + (skinMod?.on ? ' on' : '') + (skinModBusy || !skinMod ? ' busy' : '')}
+                    data-skinmod={skinMod?.on ? 'on' : 'off'}
+                    role="switch"
+                    aria-checked={!!skinMod?.on}
+                    aria-label="Скин Millida в игре"
+                    onClick={() => {
+                      if (!skinModBusy && skinMod) void toggleSkinMod()
+                    }}
+                  ></span>
+                </div>
+              ) : null}
+              <div className="bx-opts-cap">Файлы</div>
+              <div className="set-row">
+                <span className="lab">
+                  Починить сборку
+                </span>
+                <button
+                  className="btn sm secondary"
+                  id="bsRepair"
+                  disabled={repairBusy}
+                  onClick={() => {
+                    setRepairBusy(true)
+                    runRepair(profile!).finally(() => setRepairBusy(false))
+                  }}
+                >
+                  <Icon id="i-restart" /> {repairBusy ? 'Чиним…' : 'Починить'}
+                </button>
+              </div>
+              {guarded ? null : (
+              <div className="set-row">
+                <span className="lab">Папка сборки</span>
+                <button
+                  className="btn sm secondary"
+                  id="bsFolder"
+                  onClick={() => {
+                    if (hasTauri()) openProfileFolder(profile!)
+                    else showToast('Папка (демо)')
+                  }}
+                >
+                  <Icon id="i-folder" /> Открыть
+                </button>
+              </div>
+              )}
+              <div className="set-row">
+                <span className="lab">
+                  Копия сборки
+                </span>
+                <button
+                  className="btn sm secondary"
+                  id="bsDup"
+                  onClick={() => {
+                    if (!hasTauri()) {
+                      showToast('Доступно в приложении')
+                      return
+                    }
+                    duplicateProfile(profile!)
+                      .then(() => {
+                        close()
+                        void useProfiles.getState().refresh()
+                        showToast('Сборка продублирована')
+                      })
+                      .catch((e) => showToast('Не удалось продублировать: ' + e, 'error'))
+                  }}
+                >
+                  <Icon id="i-copy" /> Дублировать
+                </button>
+              </div>
+              <div className="set-row">
+                <span className="lab">
+                  Копия под другую версию
+                </span>
+                <button
+                  className="btn sm secondary"
+                  id="bsMigrate"
+                  onClick={() => {
+                    if (!profile || !pr) return
+                    useMigrate.getState().open(profile, pr.version, loaderId(pr))
+                  }}
+                >
+                  <Icon id="i-arrow-r" /> Перенести
+                </button>
+              </div>
+              <button
+                className={'bx-opts-cap bx-opts-toggle' + (advanced ? ' on' : '')}
+                aria-expanded={advanced}
+                onClick={() => setAdvanced((v) => !v)}
+              >
+                <Icon id={advanced ? 'i-chev-d' : 'i-chev-r'} /> Для опытных
+              </button>
+              <div style={{ display: advanced ? '' : 'none' }}>
+                <div className="set-row">
+                  <span className="lab">
+                    Аргументы JVM
+                  </span>
+                  <div className="input sm" style={{ width: '220px' }}>
+                    <input
+                      id="bsJvm"
+                      placeholder="-XX:+UseG1GC"
+                      value={jvm}
+                      onChange={(e) => setJvm(e.target.value)}
+                      onBlur={saveOpts}
+                    />
+                  </div>
+                </div>
+                <div className="set-row" style={{ alignItems: 'flex-start' }}>
+                  <span className="lab">
+                    Java
+                    <small>
+                      {javaBusy
+                        ? 'Качаем Java ' + javaBusy + '…'
+                        : javaMajor
+                          ? 'Java ' + javaMajor + ' от лаунчера'
+                          : 'Пусто — подберём сами'}
+                    </small>
+                  </span>
+                  <div style={{ width: '300px' }}>
+                    <Select
+                      width="100%"
+                      value={String(javaMajor)}
+                      disabled={!!javaBusy}
+                      options={[
+                        { value: '0', label: 'Версия Java: авто', sub: 'Ту, которую просит сборка' },
+                        ...javaAll.map((m) => ({ value: String(m), label: 'Java ' + m, sub: 'Скачаем и закрепим за сборкой' })),
+                      ]}
+                      onChange={(v) => pinJavaMajor(Number(v))}
+                    />
+                    <div className="input sm" style={{ margin: '6px 0' }}>
+                      <input
+                        id="bsJava"
+                        placeholder="Номер версии (25) или путь к java"
+                        value={java}
+                        onChange={(e) => setJava(e.target.value)}
+                        onBlur={saveJavaField}
+                      />
+                    </div>
+                    <Select
+                      width="100%"
+                      value={java && javaList.some((j) => j.path === java) ? java : ''}
+                      disabled={!javaList.length}
+                      placeholder={
+                        javaList.length ? 'Найденные (' + javaList.length + ')' : 'Ищем Java…'
+                      }
+                      options={javaList.map((j) => ({ value: j.path, label: j.version, sub: j.path }))}
+                      onChange={(v) => {
+                        setJava(v)
+                        if (hasTauri() && profile)
+                          saveProfileSettings(profile, jvm || '', +w || 0, +h || 0, v)
+                            .then(() => {
+                              setJavaMajor(0)
+                              showToast('Java выбрана')
+                            })
+                            .catch((e) => {
+                              trackFailure('build_settings', maskBuild(e, profile), { step: 'java_select' })
+                              showToast('' + e, 'error')
+                            })
+                      }}
+                    />
+                    <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
+                      <button
+                        className="btn sm secondary"
+                        id="bsJavaBrowse"
+                        style={{ flex: 1 }}
+                        onClick={() => {
+                          if (!hasTauri()) {
+                            showToast('Доступно в приложении')
+                            return
+                          }
+                          pickJavaPath()
+                            .then((j) => {
+                              if (!j) return
+                              setJava(j.path)
+                              setJavaList((l) => (l.some((x) => x.path === j.path) ? l : [j, ...l]))
+                              if (profile)
+                                saveProfileSettings(profile, jvm || '', +w || 0, +h || 0, j.path)
+                                  .then(() => setJavaMajor(0))
+                                  .catch((e) => {
+                                    trackFailure('build_settings', maskBuild(e, profile), { step: 'java_save' })
+                                    showToast('' + e, 'error')
+                                  })
+                              showToast('Java выбрана: ' + j.version)
+                            })
+                            .catch((e) => {
+                              trackFailure('build_settings', e, { step: 'java_pick' })
+                              showToast('' + e, 'error')
+                            })
+                        }}
+                      >
+                        Обзор…
+                      </button>
+                      <button
+                        className="btn sm secondary"
+                        id="bsJavaDetect"
+                        style={{ flex: 1 }}
+                        onClick={() => {
+                          if (!hasTauri()) {
+                            showToast('Доступно в приложении')
+                            return
+                          }
+                          setDetectLabel('Ищем…')
+                          detectJava()
+                            .then((list) => {
+                              setDetectLabel('Найти')
+                              setJavaList(list)
+                              showToast(
+                                list.length
+                                  ? 'Найдено Java: ' + list.length
+                                  : 'Java в системе не найдена — жми «Обзор…» или оставь пусто, скачаем сами',
+                              )
+                            })
+                            .catch((e) => {
+                              setDetectLabel('Найти')
+                              showToast('' + e)
+                            })
+                        }}
+                      >
+                        {detectLabel}
+                      </button>
+                      <button
+                        className="btn sm secondary"
+                        id="bsJavaTest"
+                        style={{ flex: 1 }}
+                        onClick={() => {
+                          if (!hasTauri()) {
+                            showToast('Доступно в приложении')
+                            return
+                          }
+                          const p = java.trim()
+                          if (!p) {
+                            showToast('Пусто = скачаем нужную Java сами')
+                            return
+                          }
+                          testJava(p)
+                            // Статус несёт иконка тоста (i-check / i-alert), дингбаты в тексте не нужны
+                            .then((v) => showToast(String(v)))
+                            .catch((e) => showToast(apiErrorText(e, 'Не удалось выполнить действие'), 'error'))
+                        }}
+                      >
+                        Тест
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div className="set-row">
+                  <span className="lab">
+                    Размер окна
+                  </span>
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    <div className="input sm" style={{ width: '80px' }}>
+                      <input
+                        id="bsW"
+                        type="number"
+                        placeholder="Ширина"
+                        value={w}
+                        onChange={(e) => setW(e.target.value)}
+                        onBlur={saveOpts}
+                      />
+                    </div>
+                    <div className="input sm" style={{ width: '80px' }}>
+                      <input
+                        id="bsH"
+                        type="number"
+                        placeholder="Высота"
+                        value={h}
+                        onChange={(e) => setH(e.target.value)}
+                        onBlur={saveOpts}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="set-row bx-danger-row">
+                <span className="lab">Удалить сборку</span>
+                <button
+                  className="btn sm danger"
+                  id="bsDelete"
+                  onClick={async () => {
+                    if (
+                      !(await uiConfirm(
+                        'Удалить сборку «' + profile + '» со всеми модами, мирами и часами игры? Отменить будет нельзя.',
+                        { confirmLabel: 'Удалить' },
+                      ))
+                    )
+                      return
+                    if (hasTauri()) {
+                      deleteProfile(profile!)
+                        .then(() => {
+                          close()
+                          useProfiles.getState().setSelected(null)
+                          void useProfiles.getState().refresh()
+                          showToast('Сборка удалена', 'ok', 'delete')
+                        })
+                        .catch((e) => {
+                          void useProfiles.getState().refresh()
+                          showToast('' + e, 'error')
+                        })
+                    } else {
+                      close()
+                      showToast('Удалено (демо)')
+                    }
+                  }}
+                >
+                  <Icon id="i-trash" /> Удалить
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      {safetyOpen ? (
+        <SafetyModal profile={profile!} onClose={() => setSafetyOpen(false)} onChanged={() => loadMods()} />
+      ) : null}
+      {shareOpen ? <SharePackModal profile={profile!} onClose={() => setShareOpen(false)} /> : null}
+      {pickIcon && profile ? <BuildIconPicker name={profile} icon={pr ? pr.icon : null} onClose={() => setPickIcon(false)} /> : null}
+      {iconEditor && profile ? (
+        <IconEditor
+          title={profile}
+          current={recallIconRecipe(profile)}
+          onCancel={() => setIconEditor(false)}
+          onSave={(data, r) => {
+            if (!hasTauri()) {
+              showToast('Доступно в приложении', 'error')
+              return
+            }
+            setProfileIcon(profile, data)
+              .then(() => {
+                rememberIconRecipe(profile, r)
+                setIconEditor(false)
+                void useProfiles.getState().refresh()
+                showToast('Иконка обновлена')
+              })
+              .catch((e) => showToast('Не удалось сохранить иконку: ' + e, 'error'))
+          }}
+        />
+      ) : null}
+    </div>
+  )
+}

@@ -1,0 +1,279 @@
+import { create } from 'zustand'
+import type { StoreApi, UseBoundStore } from 'zustand'
+import { MR_PAGE, loadCf, loadMr, mrSearchUrl, mrToHit, useMods } from '../../state/mods'
+import { PER_PAGE, SITE_SECTIONS, loadFacets, loadListing, loadPremiumPacks, premiumCard, sectionByKind, sectionBySlug } from './site'
+import type { SiteCard, SiteFacets, SiteSlug } from './site'
+import { appendMr, cardFromMrHit, cfKind, mrHasMore, mrTarget, nextLoad } from './mrTail'
+import type { MrTarget } from './mrTail'
+import type { MillidaPack } from '../../ipc/commands'
+import { foreignTailAllowed } from './sections'
+import type { EditionFilter, PriceFilter } from './sections'
+import { inTime } from '../../lib/deadline'
+import { hasTauri } from '../../ipc/tauri'
+
+/*
+ * Состояние каталога сайта в лаунчере: раздел и фильтры — как адрес страницы
+ * на millida.net (`/mods/1.21.1/fabric?category=…&q=…&sort=new`), выдача — как
+ * её лента. Раздел заодно выставляется в `useMods.modTab`: по нему кнопка
+ * строки понимает, что ставит — мод, пак, шейдер или сборку.
+ */
+
+export type SiteSort = 'recommended' | 'popular' | 'new'
+export type SiteAccess = 'all' | 'premium' | 'free'
+
+export interface SiteState {
+  section: SiteSlug
+  version: string | null
+  loader: string | null
+  category: string | null
+  q: string
+  sort: SiteSort
+  access: SiteAccess
+  /** Издание, «Для чего» и цена — колонки фильтров сайта (30.09.2026). */
+  edition: EditionFilter | null
+  use: string | null
+  price: PriceFilter | null
+  items: SiteCard[]
+  total: number
+  page: number
+  pages: number
+  facets: SiteFacets | null
+  mr: SiteCard[]
+  mrTotal: number
+  mrOffset: number
+  mrMore: boolean
+  cf: SiteCard[]
+  busy: boolean
+  failed: boolean
+  setSection: (s: SiteSlug) => void
+  patch: (p: Partial<Pick<SiteState, 'version' | 'loader' | 'category' | 'q' | 'sort' | 'access' | 'edition' | 'use' | 'price'>>) => void
+  reset: () => void
+  load: (more?: boolean) => Promise<void>
+}
+
+export type SiteStore = UseBoundStore<StoreApi<SiteState>>
+
+const MR_EMPTY = { mr: [] as SiteCard[], mrTotal: 0, mrOffset: 0, mrMore: false, cf: [] as SiteCard[] }
+
+interface MrPage {
+  cards: SiteCard[]
+  got: number
+  total: number
+}
+
+async function loadMrPage(
+  target: MrTarget,
+  st: Pick<SiteState, 'section' | 'version' | 'loader' | 'sort'>,
+  q: string,
+  offset: number,
+): Promise<MrPage> {
+  const loaderFacet = st.loader && (target.type === 'mod' || target.type === 'modpack') ? st.loader : null
+  const shaderLoader = st.loader && target.type === 'shader' ? [st.loader] : []
+  const data = await loadMr(
+    mrSearchUrl({
+      tab: target.type,
+      ver: st.version || 'любая',
+      loader: loaderFacet || 'любой',
+      cat: target.category || 'все',
+      cats: shaderLoader,
+      side: 'any',
+      openSource: false,
+      sort: st.sort === 'new' ? 'Новые' : 'Популярные',
+      query: q,
+      offset,
+    }),
+  )
+  if (!data || !Array.isArray(data.hits)) throw new Error('Modrinth search answered without hits')
+  const cards = data.hits
+    .map((h: unknown) => cardFromMrHit(mrToHit(h), st.section))
+    .filter((c: SiteCard | null): c is SiteCard => !!c)
+  return { cards, got: data.hits.length, total: typeof data.total_hits === 'number' ? data.total_hits : 0 }
+}
+
+async function loadCfPage(kind: string, st: Pick<SiteState, 'section' | 'version' | 'loader'>, q: string): Promise<SiteCard[]> {
+  const hits = await loadCf({
+    query: q,
+    kind,
+    ver: st.version || '',
+    loader: st.loader && (kind === 'mod' || kind === 'modpack') ? st.loader : '',
+    index: 0,
+    category: 0,
+    sort: 0,
+  })
+  return hits.map((h) => cardFromMrHit(h, st.section)).filter((c): c is SiteCard => !!c)
+}
+
+/**
+ * Состояние одного экземпляра каталога. `linked` — каталог «Ресурсов»: раздел
+ * заодно ставится в `useMods.modTab` (по нему кнопка строки понимает, что
+ * ставит в сборку). Каталог сервера (вкладка контента хостинга) живёт своим
+ * экземпляром: его раздел и фильтры не сбивают «Ресурсы», и наоборот.
+ */
+function createSiteStore(linked: boolean): SiteStore {
+  let seq = 0
+  return create<SiteState>((set, get) => ({
+    section: linked ? sectionByKind(useMods.getState().modTab).slug : 'modpacks',
+    version: null,
+    loader: null,
+    category: null,
+    q: '',
+    sort: 'recommended',
+    access: 'all',
+    edition: null,
+    use: null,
+    price: null,
+    items: [],
+    total: 0,
+    page: 0,
+    pages: 0,
+    facets: null,
+    ...MR_EMPTY,
+    busy: false,
+    failed: false,
+    setSection: (s) => {
+      const sec = sectionBySlug(s)
+      // Вид установки «Ресурсов» — только у разделов, которые ставятся в сборку:
+      // «Все», читы, скины и прочее ставятся своим путём и modTab не трогают.
+      if (linked && SITE_SECTIONS.includes(sec)) {
+        useMods.getState().set({ modTab: sec.kind, fCats: [], fCat: 'все', count: '' })
+        void useMods.getState().refreshInstalled()
+      }
+      set({ section: s, version: null, loader: null, category: null, q: '', access: 'all', edition: null, use: null, price: null, items: [], total: 0, page: 0, facets: null, ...MR_EMPTY })
+      void get().load()
+    },
+    patch: (p) => {
+      set(p)
+      void get().load()
+    },
+    reset: () => {
+      set({ version: null, loader: null, category: null, q: '', access: 'all', edition: null, use: null, price: null })
+      void get().load()
+    },
+    load: async (more) => {
+      const my = ++seq
+      const st = get()
+      if (sectionBySlug(st.section).source !== 'listing') return
+      const q = st.q.trim()
+      const tail = linked && foreignTailAllowed(st)
+      const mrq = tail ? mrTarget(st.section, st.category) : null
+      const cfq = tail && hasTauri() ? cfKind(st.section, st.category, q) : null
+      if (more && nextLoad(st) !== 'millida') {
+        if (!mrq || nextLoad(st) !== 'modrinth') return
+        set({ busy: true })
+        const got = await inTime(loadMrPage(mrq, st, q.length >= 2 ? q : '', st.mrOffset)).catch(() => null)
+        if (my !== seq) return
+        if (!got) {
+          set({ busy: false })
+          return
+        }
+        set({
+          mr: appendMr(get().mr, got.cards),
+          mrTotal: got.total,
+          mrOffset: st.mrOffset + got.got,
+          mrMore: mrHasMore(st.mrOffset, got.got, got.total, MR_PAGE),
+          busy: false,
+        })
+        return
+      }
+      const page = more ? st.page + 1 : 1
+      set({ busy: true, failed: false })
+      // Платные сборки — только в «Ресурсах»: на сервер они не ставятся.
+      const packs = linked && st.section === 'modpacks'
+      const [listing, facets, premium, mrFirst, cfFirst] = await Promise.all([
+        inTime(loadListing({
+          section: st.section,
+          version: st.version,
+          loader: st.loader,
+          category: st.category,
+          q: q.length >= 2 ? q : null,
+          sort: st.sort,
+          page,
+          perPage: PER_PAGE,
+          edition: st.edition,
+          use: st.use,
+          price: st.price,
+        })).catch(() => null),
+        more ? Promise.resolve(get().facets) : inTime(loadFacets(st.section, st.version, st.loader, st.edition)).catch(() => null),
+        packs ? inTime(loadPremiumPacks()).catch(() => [] as MillidaPack[]) : Promise.resolve([] as MillidaPack[]),
+        !more && mrq ? inTime(loadMrPage(mrq, st, q.length >= 2 ? q : '', 0)).catch(() => null) : Promise.resolve(null),
+        !more && cfq ? inTime(loadCfPage(cfq, st, q)).catch(() => [] as SiteCard[]) : Promise.resolve([] as SiteCard[]),
+      ])
+      if (my !== seq) return
+      if (!listing) {
+        set({ busy: false, failed: !more, ...(more ? {} : { items: [] }) })
+        return
+      }
+      const paid = new Map(premium.map((p) => [p.slug, p]))
+      let got = listing.items.map((c) => {
+        const pack = paid.get(c.slug)
+        return pack ? { ...c, premium: true, partner: pack.partner ?? null } : c
+      })
+      if (packs && st.access === 'premium') {
+        const only = premiumOnly(premium, st, q)
+        set({ items: only, total: only.length, page: 1, pages: 1, facets: facets || get().facets, ...MR_EMPTY, busy: false })
+        return
+      }
+      if (packs && st.access === 'free') got = got.filter((c) => !c.premium)
+      else if (!more && packs && st.sort === 'recommended') got = pinArcania(got, premium, st, q)
+      const hidden = packs && st.access === 'free' ? premium.filter((p) => matchesFilters(p, st, q)).length : 0
+      // Лента могла сдвинуться между страницами (новый материал сверху) — без дублей.
+      const items = more ? get().items.concat(got.filter((i) => !get().items.some((x) => x.slug === i.slug))) : got
+      const mrState = more
+        ? {}
+        : mrFirst
+          ? { mr: mrFirst.cards, mrTotal: mrFirst.total, mrOffset: mrFirst.got, mrMore: mrHasMore(0, mrFirst.got, mrFirst.total, MR_PAGE), cf: cfFirst }
+          : { ...MR_EMPTY, cf: cfFirst }
+      set({ items, total: Math.max(0, listing.total - hidden), page: listing.page, pages: listing.pages, facets: facets || get().facets, ...mrState, busy: false })
+    },
+  }))
+}
+
+/** Каталог «Ресурсов» (клиент: в сборку). */
+export const useSite = createSiteStore(true)
+/** Каталог сервера — вкладка контента панели хостинга. */
+export const useServerSite = createSiteStore(false)
+
+const ARCANIA = 'arcania'
+
+/** Подходит ли платная сборка под выбранные версию, загрузчик и поиск: категорий у неё нет. */
+function matchesFilters(p: MillidaPack, st: Pick<SiteState, 'version' | 'loader' | 'category'> & Partial<Pick<SiteState, 'edition' | 'use' | 'price'>>, q: string): boolean {
+  const needle = q.length >= 2 ? q.toLowerCase() : ''
+  // Платная сборка Java без задач «Для чего»: под «Бесплатно», Bedrock и задачу не подходит.
+  if (st.edition === 'BEDROCK' || st.price === 'free' || st.use) return false
+  return (
+    !st.category &&
+    (!st.version || p.game === st.version) &&
+    (!st.loader || p.loader === st.loader) &&
+    (!needle || (p.title + ' ' + p.summary).toLowerCase().includes(needle))
+  )
+}
+
+/**
+ * В «Популярных» первой стоит только Arcania, остальные платные идут в ленте
+ * вперемешку с бесплатными (владелец, 26.09.2026). Нет её на первой странице —
+ * встаёт строкой из каталога сборок, если подходит под фильтры.
+ */
+function pinArcania(page: SiteCard[], premium: MillidaPack[], st: Pick<SiteState, 'version' | 'loader' | 'category'> & Partial<Pick<SiteState, 'edition' | 'use' | 'price'>>, q: string): SiteCard[] {
+  const hit = page.find((c) => c.slug === ARCANIA)
+  const pack = premium.find((p) => p.slug === ARCANIA)
+  const top = hit || (pack && matchesFilters(pack, st, q) ? premiumCard(pack) : null)
+  return top ? [top, ...page.filter((c) => c.slug !== ARCANIA)] : page
+}
+
+/** Фильтр «Премиум»: только платные сборки, Arcania первой. */
+function premiumOnly(premium: MillidaPack[], st: Pick<SiteState, 'version' | 'loader' | 'category'> & Partial<Pick<SiteState, 'edition' | 'use' | 'price'>>, q: string): SiteCard[] {
+  const cards = premium.filter((p) => matchesFilters(p, st, q)).map(premiumCard)
+  return [...cards.filter((c) => c.slug === ARCANIA), ...cards.filter((c) => c.slug !== ARCANIA)]
+}
+
+/** Сколько фильтров выбрано — число на кнопке «Фильтры» в узком окне. */
+export const activeFilters = (
+  s: Pick<SiteState, 'version' | 'loader' | 'category'> & { access?: SiteAccess; edition?: string | null; use?: string | null; price?: string | null },
+): number =>
+  (s.version ? 1 : 0) +
+  (s.loader ? 1 : 0) +
+  (s.category ? 1 : 0) +
+  (s.access && s.access !== 'all' ? 1 : 0) +
+  (s.edition ? 1 : 0) +
+  (s.use ? 1 : 0) +
+  (s.price ? 1 : 0)
